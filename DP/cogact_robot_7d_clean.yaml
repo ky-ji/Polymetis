@@ -1,0 +1,37 @@
+name: cogact_robot_7d_clean
+
+# CogAct CLEAN dataset (starting from episode 65)
+# Image resolution: 640x480 (resized from 1920x1080)
+image_shape: [3, 480, 640]
+dataset_path: /home/kyji/public/dataset/cogact/1124/diffusion_policy_data_clean_640x480.zarr
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    image:
+      shape: ${task.image_shape}
+      type: rgb
+    robot_eef_pose:
+      shape: [7]  # [x, y, z, qx, qy, qz, qw]
+      type: low_dim
+    robot_gripper_state:
+      shape: [1]  # gripper state (0=open, 1=closed)
+      type: low_dim
+  action:
+    shape: [7]  # [x, y, z, qx, qy, qz, qw]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.cogact_image_dataset.CogActImageDataset
+  shape_meta: *shape_meta
+  zarr_path: ${task.dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  n_latency_steps: ${n_latency_steps}
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null
