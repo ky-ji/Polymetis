@@ -16,12 +16,14 @@ class JointReference {
   using Vector = std::array<double, 7>;
   JointReference(Vector q, Vector velocity, Vector lower, Vector upper,
                  Vector max_velocity, Vector max_acceleration, Vector max_jerk,
-                 double dt, double timeout)
+                 double dt, double timeout, double lookahead = 0.0)
       : q(q), velocity(velocity), lower_(lower), upper_(upper),
-        generator_(dt), dt_(dt), timeout_ns_(0) {
+        generator_(dt), dt_(dt), lookahead_(lookahead), timeout_ns_(0) {
     if (!std::isfinite(dt) || dt <= 0 || dt > 0.01 ||
         !std::isfinite(timeout) || timeout < dt || timeout > 1.0)
       throw std::invalid_argument("invalid reference period or timeout");
+    if (!std::isfinite(lookahead) || lookahead < 0.0 || lookahead > 0.06)
+      throw std::invalid_argument("lookahead must be in [0, 0.06] seconds");
     timeout_ns_ = static_cast<std::int64_t>(timeout * 1e9);
     for (std::size_t i = 0; i < 7; ++i) {
       if (!std::isfinite(lower[i]) || !std::isfinite(upper[i]) || lower[i] >= upper[i] ||
@@ -55,7 +57,7 @@ class JointReference {
         for (std::size_t i = 0; i < 7; ++i)
           valid = valid && std::isfinite(target[i]) && target[i] >= lower_[i] && target[i] <= upper_[i];
         if (!valid) latch(2);
-        else if (!plan(target, false)) {
+        else if (!plan(streaming_target(target, now_ns, paused), false)) {
           if (last_plan_error == -1024) {
             // A reachable endpoint can still imply overshoot from the current
             // velocity/acceleration. Reject that replacement and finish the
@@ -68,7 +70,11 @@ class JointReference {
         }
       }
     }
-    if (paused) received_at_ = now_ns;
+    if (paused) {
+      received_at_ = now_ns;
+      was_paused_ = true;
+      target_velocity_.fill(0.0);
+    }
     if (status == 0 && !paused && received_at_ >= 0 && now_ns - received_at_ >= timeout_ns_) latch(1);
     elapsed_ = std::min(elapsed_ + dt_, trajectory_.get_duration());
     trajectory_.at_time(elapsed_, q, velocity, acceleration);
@@ -82,6 +88,31 @@ class JointReference {
   std::uint64_t boundary_rejections = 0;
 
  private:
+  Vector streaming_target(const Vector& target, std::int64_t now, bool paused) {
+    if (lookahead_ == 0.0) return target;
+    auto result = target;
+    const double period = sample_time_ < 0 ? 0.0 : (now - sample_time_) * 1e-9;
+    if (paused || was_paused_ || period <= 0 || period > 0.025) {
+      target_velocity_.fill(0.0);
+    } else {
+      // Estimate only from received samples. The prediction is bounded by the
+      // configured speed and 60 ms; the entire resulting zero-terminal plan
+      // still has to pass the existing position, velocity, acceleration and
+      // jerk checks. No extra motion is extrapolated between received samples.
+      const double alpha = period / (0.020 + period);
+      for (std::size_t i = 0; i < 7; ++i) {
+        const double observed = (target[i] - previous_target_[i]) / period;
+        target_velocity_[i] += alpha * (std::clamp(observed, -input_.max_velocity[i],
+                                                 input_.max_velocity[i]) - target_velocity_[i]);
+        result[i] = std::clamp(target[i] + lookahead_ * target_velocity_[i], lower_[i], upper_[i]);
+      }
+    }
+    sample_time_ = now;
+    previous_target_ = target;
+    was_paused_ = paused;
+    return result;
+  }
+
   bool plan(const Vector& target, bool stop) {
     auto candidate_input = input_;
     candidate_input.current_position = q;
@@ -113,11 +144,13 @@ class JointReference {
     plan(q, true);
   }
 
-  Vector lower_, upper_;
+  Vector lower_, upper_, previous_target_{}, target_velocity_{};
   ruckig::Ruckig<7> generator_;
   ruckig::InputParameter<7> input_;
   ruckig::Trajectory<7> trajectory_;
-  double dt_, elapsed_ = 0;
+  double dt_, lookahead_, elapsed_ = 0;
+  std::int64_t sample_time_ = -1;
+  bool was_paused_ = true;
   std::int64_t timeout_ns_, sequence_ = -1, received_at_ = -1, last_time_ = -1;
 };
 }  // namespace polymetis_runtime

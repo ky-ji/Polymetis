@@ -9,7 +9,8 @@ class TorchJointReference : public torch::CustomClassHolder {
   explicit TorchJointReference(torch::Tensor config)
       : config_(validate(config)), engine_(vector(0), vector(7), vector(14), vector(21),
                                           vector(28), vector(35), vector(42),
-                                          config_[49].item<double>(), config_[50].item<double>()),
+                                          config_[49].item<double>(), config_[50].item<double>(),
+                                          config_.size(0) == 52 ? config_[51].item<double>() : 0.0),
         output_(torch::zeros({4, 7}, torch::kFloat32)) {}
 
   torch::Tensor step(torch::Tensor target, std::int64_t sequence, bool paused) {
@@ -49,8 +50,9 @@ class TorchJointReference : public torch::CustomClassHolder {
 
  private:
   static torch::Tensor validate(torch::Tensor config) {
-    TORCH_CHECK(config.device().is_cpu() && config.dim() == 1 && config.size(0) == 51,
-                "joint reference configuration must contain 51 CPU scalars");
+    TORCH_CHECK(config.device().is_cpu() && config.dim() == 1 &&
+                (config.size(0) == 51 || config.size(0) == 52),
+                "joint reference configuration must contain 51 or 52 CPU scalars");
     return config.to(torch::kFloat64).contiguous().clone();
   }
   polymetis_runtime::JointReference::Vector vector(std::size_t offset) {

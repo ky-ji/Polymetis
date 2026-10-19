@@ -12,7 +12,7 @@ void require(bool value, const char* message) {
 }
 
 int main(int argc, char** argv) {
-  require(argc == 2, "expected a joint-target fixture");
+  require(argc == 2 || argc == 3, "expected a joint-target fixture and optional lookahead");
   std::ifstream input(argv[1]);
   Vector config[7];
   for (auto& row : config) {
@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
   }
   require(!targets.empty(), "no targets");
   Reference reference(config[0], config[1], config[2], config[3], config[4],
-                      config[5], config[6], .001, .15);
+                      config[5], config[6], .001, .15, argc==3 ? std::stod(argv[2]) : 0.0);
   for (std::int64_t i = 0; i < 60000; ++i) {
     const auto previous = reference.acceleration;
     reference.step(targets[(i / 30) % targets.size()], i / 10, i * 1000000);
