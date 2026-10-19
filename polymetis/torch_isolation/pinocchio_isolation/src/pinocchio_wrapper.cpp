@@ -7,6 +7,9 @@
 #include <stdexcept>
 #include <string>
 
+// Eigen must be parsed before Pinocchio 2.5's internal::fix namespace,
+// which otherwise shadows Eigen 3.4's fix<N> template in LU headers.
+#include <Eigen/Dense>
 #include "pinocchio/algorithm/frames.hpp"
 #include "pinocchio/algorithm/jacobian.hpp"
 #include "pinocchio/algorithm/joint-configuration.hpp"

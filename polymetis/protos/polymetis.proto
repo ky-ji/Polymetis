@@ -133,12 +133,22 @@ message RobotState {
   float prev_controller_latency_ms = 10;                  //Latency of previous ControlUpdate call
   bool prev_command_successful = 11;                      //Whether previous command packet is successfully transmitted
   int32 error_code = 12;
+  repeated float joint_position_reference = 13;
+  repeated float joint_velocity_reference = 14;
+  repeated float joint_acceleration_reference = 15;
+  int32 servo_status = 16;
+  bool has_servo_reference = 17;
 }
 
 message TorqueCommand {
   // Contains the command sent to the robot.
   google.protobuf.Timestamp timestamp = 1;
   repeated float joint_torques = 2;
+  repeated float joint_position_reference = 3;
+  repeated float joint_velocity_reference = 4;
+  repeated float joint_acceleration_reference = 5;
+  int32 servo_status = 6;
+  bool has_servo_reference = 7;
 }
 
 message Empty {}

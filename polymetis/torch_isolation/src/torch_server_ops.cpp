@@ -141,6 +141,17 @@ std::vector<float> TorchScriptedController::forward(TorchRobotState &input) {
   torch::jit::IValue key = torch::jit::IValue("joint_torques");
   torch::Tensor desired_torque = controller_state_dict.at(key).toTensor();
 
+  has_servo_reference_ = controller_state_dict.contains("joint_reference");
+  if (has_servo_reference_) {
+    const char* keys[] = {"joint_reference", "joint_velocity_reference", "joint_acceleration_reference"};
+    for (int part = 0; part < 3; ++part) {
+      auto values = controller_state_dict.at(keys[part]).toTensor();
+      TORCH_CHECK(values.numel() == 7, "servo reference must have seven entries");
+      for (int i = 0; i < 7; ++i) servo_reference_[part * 7 + i] = values[i].item<float>();
+    }
+    servo_reference_[21] = controller_state_dict.at("servo_status").toTensor()[0].item<float>();
+  }
+
   std::vector<float> result;
   for (int i = 0; i < input.num_dofs_; i++) {
     result.push_back(desired_torque[i].item<float>());

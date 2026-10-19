@@ -3,6 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 #include <string>
+#include <cmath>
 
 #include "polymetis/polymetis_server.hpp"
 
@@ -146,6 +147,17 @@ Status
 PolymetisControllerServerImpl::ControlUpdate(ServerContext *context,
                                              const RobotState *robot_state,
                                              TorqueCommand *torque_command) {
+  if (!torch_robot_state_ || !robot_client_context_.default_controller)
+    return Status(StatusCode::FAILED_PRECONDITION, "Robot client is not initialized");
+  for (const auto* values : {&robot_state->joint_positions(), &robot_state->joint_velocities(),
+                             &robot_state->motor_torques_measured(), &robot_state->motor_torques_external()}) {
+    if (values->size() != num_dofs_)
+      return Status(StatusCode::INVALID_ARGUMENT, "Robot feedback dimension mismatch");
+    for (float value : *values)
+      if (!std::isfinite(value))
+        return Status(StatusCode::INVALID_ARGUMENT, "Robot feedback must be finite");
+  }
+
   // Check if last update is stale
   if (!validRobotContext()) {
     spdlog::warn("Interrupted control update greater than threshold of {} ns. "
@@ -206,6 +218,17 @@ PolymetisControllerServerImpl::ControlUpdate(ServerContext *context,
     return Status(StatusCode::CANCELLED, error_msg);
   }
 
+  // Capture the reference before releasing controller ownership.
+  torque_command->set_has_servo_reference(controller->has_servo_reference());
+  if (controller->has_servo_reference()) {
+    const auto& reference = controller->servo_reference();
+    for (int i = 0; i < 7; ++i) {
+      torque_command->add_joint_position_reference(reference[i]);
+      torque_command->add_joint_velocity_reference(reference[7 + i]);
+      torque_command->add_joint_acceleration_reference(reference[14 + i]);
+    }
+    torque_command->set_servo_status(static_cast<int>(reference[21]));
+  }
   // Unlock
   custom_controller_context_.controller_mtx.unlock();
   for (int i = 0; i < num_dofs_; i++) {
@@ -219,6 +242,11 @@ PolymetisControllerServerImpl::ControlUpdate(ServerContext *context,
     robot_state_copy.add_joint_torques_computed(
         torque_command->joint_torques(i));
   }
+  robot_state_copy.mutable_joint_position_reference()->CopyFrom(torque_command->joint_position_reference());
+  robot_state_copy.mutable_joint_velocity_reference()->CopyFrom(torque_command->joint_velocity_reference());
+  robot_state_copy.mutable_joint_acceleration_reference()->CopyFrom(torque_command->joint_acceleration_reference());
+  robot_state_copy.set_servo_status(torque_command->servo_status());
+  robot_state_copy.set_has_servo_reference(torque_command->has_servo_reference());
   robot_state_buffer_.append(robot_state_copy);
 
   // Update timestep & check termination

@@ -1,0 +1,13 @@
+{
+  "libfranka": {
+    "version": "0.18.2",
+    "commit": "b9091305cbfa9bb3d106c6dbfa58f1aa880d9e4d",
+    "common_commit": "d96c221a32c343384cbe2f77c61116ed58b84231",
+    "tree_sha256_after_archive_patch": "6600c6c852a5223fb0809d62069a8a9ec92afb2557c6964890fc869888ab94cc"
+  },
+  "ruckig": {
+    "version": "0.15.3",
+    "commit": "37b6e7a4c60f5befd2506741d5f7d0ae7eefb3db",
+    "tree_sha256": "778a3dc5987f82d934df2f494f28f2c96f41e1b94af0ca9d48616fd35d7d3ea7"
+  }
+}

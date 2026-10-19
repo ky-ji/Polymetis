@@ -9,19 +9,23 @@ import torch
 from polymetis.utils.data_dir import PKG_ROOT_DIR
 
 
-try:
-    torch.ops.load_library(f"{os.environ['CONDA_PREFIX']}/lib/libtorchrot.so")
-except OSError:
-    lib_path = os.path.abspath(
-        os.path.join(
-            PKG_ROOT_DIR,
-            "../../build/torch_isolation/libtorchrot.so",
+if os.environ.get("POLYMETIS_TORCH_LIB_DIR"):
+    # Explicit isolated runtimes must never fall back to another installation.
+    torch.ops.load_library(os.path.join(os.environ["POLYMETIS_TORCH_LIB_DIR"], "libtorchrot.so"))
+else:
+    try:
+        torch.ops.load_library(f"{os.environ['CONDA_PREFIX']}/lib/libtorchrot.so")
+    except OSError:
+        lib_path = os.path.abspath(
+            os.path.join(
+                PKG_ROOT_DIR,
+                "../../build/torch_isolation/libtorchrot.so",
+            )
         )
-    )
-    print(
-        f"Warning: Failed to load 'libtorchrot.so' from CONDA_PREFIX, loading from default build directory instead: '{lib_path}'"
-    )
-    torch.ops.load_library(lib_path)
+        print(
+            f"Warning: Failed to load 'libtorchrot.so' from CONDA_PREFIX, loading from default build directory instead: '{lib_path}'"
+        )
+        torch.ops.load_library(lib_path)
 
 functional = torch.ops.torchrot
 

@@ -3,6 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root directory of this source tree.
 #include "polymetis/clients/franka_panda_client.hpp"
+#include "polymetis/clients/model_validation.hpp"
 
 #include "real_time.hpp"
 #include "spdlog/spdlog.h"
@@ -30,42 +31,42 @@ FrankaTorqueControlClient::FrankaTorqueControlClient(
 
   // Load robot client metadata
   std::ifstream file(robot_client_metadata_path);
-  assert(file);
+  if (!file) throw std::runtime_error("Cannot read robot client metadata");
   std::stringstream buffer;
   buffer << file.rdbuf();
   file.close();
   RobotClientMetadata metadata;
-  assert(metadata.ParseFromString(buffer.str()));
-
-  // Initialize robot client with metadata
-  ClientContext context;
-  Empty empty;
-  Status status = stub_->InitRobotClient(&context, metadata, &empty);
-  assert(status.ok());
+  if (!metadata.ParseFromString(buffer.str()) || metadata.dof() != NUM_DOFS)
+    throw std::runtime_error("Invalid robot client metadata");
+  if (config["expected_ee_link_name"] &&
+      config["expected_ee_link_name"].as<std::string>() != metadata.ee_link_name())
+    throw std::runtime_error("Robot model end-effector does not match the selected hardware profile");
 
   // Connect to robot
   mock_franka_ = config["mock"].as<bool>();
   readonly_mode_ = config["readonly"].as<bool>();
-  if (!mock_franka_) {
-    spdlog::info("Connecting to Franka Emika...");
-    robot_ptr_.reset(new franka::Robot(config["robot_ip"].as<std::string>()));
-    model_ptr_.reset(new franka::Model(robot_ptr_->loadModel()));
-    spdlog::info("Connected.");
-  } else {
-    spdlog::info(
-        "Launching Franka client in mock mode. No robot is connected.");
-  }
-
+  automatic_recovery_ = config["automatic_error_recovery"].as<bool>(false);
+  if (mock_franka_ && readonly_mode_)
+    throw std::invalid_argument("mock and readonly are mutually exclusive");
   if (readonly_mode_) {
     spdlog::info("Launching Franka client in read only mode. No control will "
                  "be executed.");
   }
+
+  rpc_timeout_ms_ = config["control_rpc_timeout_ms"].as<double>(10.0);
+  if (!std::isfinite(rpc_timeout_ms_) || rpc_timeout_ms_ <= 0 || rpc_timeout_ms_ > 100)
+    throw std::invalid_argument("control_rpc_timeout_ms must be in (0, 100]");
+  auto diagnostics = config["diagnostics"];
+  flight_recorder_.reset(new polymetis_runtime::FlightRecorder(
+      diagnostics ? diagnostics["directory"].as<std::string>("") : "",
+      diagnostics ? diagnostics["capacity"].as<std::size_t>(5000) : 5000));
 
   // Set initial state & action
   for (int i = 0; i < NUM_DOFS; i++) {
     torque_commanded_[i] = 0.0;
     torque_safety_[i] = 0.0;
     torque_applied_prev_[i] = 0.0;
+    torque_applied_[i] = 0.0;
 
     torque_command_.add_joint_torques(0.0);
 
@@ -113,8 +114,47 @@ FrankaTorqueControlClient::FrankaTorqueControlClient(
   k_joint_vel_ =
       config["safety_controller"]["stiffness"]["joint_vel"].as<double>();
 
-  // Set collision behavior
+  for (int i = 0; i < NUM_DOFS; ++i) {
+    if (!std::isfinite(joint_pos_llimits_[i]) || !std::isfinite(joint_pos_ulimits_[i]) ||
+        joint_pos_llimits_[i] >= joint_pos_ulimits_[i] ||
+        !std::isfinite(joint_vel_limits_[i]) || joint_vel_limits_[i] <= 0 ||
+        !std::isfinite(joint_torques_limits_[i]) || joint_torques_limits_[i] <= 0)
+      throw std::invalid_argument("Invalid joint limits");
+  }
+  for (int i = 0; i < 3; ++i)
+    if (!std::isfinite(cartesian_pos_llimits_[i]) || !std::isfinite(cartesian_pos_ulimits_[i]) ||
+        cartesian_pos_llimits_[i] >= cartesian_pos_ulimits_[i])
+      throw std::invalid_argument("Invalid Cartesian limits");
+  for (double value : {margin_cartesian_pos_, margin_joint_pos_, margin_joint_vel_,
+                       k_cartesian_pos_, k_joint_pos_, k_joint_vel_})
+    if (!std::isfinite(value) || value < 0)
+      throw std::invalid_argument("Invalid safety controller parameters");
+  if (!std::isfinite(elbow_vel_limit_) || elbow_vel_limit_ <= 0 ||
+      !std::isfinite(lpf_cutoff_freq_) || lpf_cutoff_freq_ <= 0 || lpf_cutoff_freq_ > 1000)
+    throw std::invalid_argument("Invalid elbow or filter limit");
+
+  // Initialize robot client with metadata
+  ClientContext context;
+  context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+  Empty empty;
+  Status status = stub_->InitRobotClient(&context, metadata, &empty);
+  if (!status.ok()) throw std::runtime_error("InitRobotClient failed: " + status.error_message());
+
   if (!mock_franka_) {
+    spdlog::info("Connecting to Franka Emika...");
+    robot_ptr_.reset(new franka::Robot(config["robot_ip"].as<std::string>()));
+    model_ptr_.reset(new franka::Model(robot_ptr_->loadModel()));
+    const auto initial_state = robot_ptr_->readOnce();
+    polymetis_runtime::validate_ee_pose(
+        model_ptr_->pose(franka::Frame::kEndEffector, initial_state), initial_state.O_T_EE);
+    spdlog::info("Connected.");
+  } else {
+    spdlog::info(
+        "Launching Franka client in mock mode. No robot is connected.");
+  }
+
+  // Read-only inspection must not change collision settings.
+  if (!mock_franka_ && !readonly_mode_) {
     robot_ptr_->setCollisionBehavior(
         config["collision_behavior"]["lower_torque"]
             .as<std::array<double, NUM_DOFS>>(),
@@ -130,7 +170,11 @@ void FrankaTorqueControlClient::run() {
   // Create callback function that relays information between gRPC server and
   // robot
   auto control_callback = [&](const franka::RobotState &libfranka_robot_state,
-                              franka::Duration) -> franka::Torques {
+                              franka::Duration period) -> franka::Torques {
+    const auto started = polymetis_runtime::monotonic_ns();
+    last_rpc_ms_ = 0.0;
+    servo_reference_ = {};
+    try {
     // Compute torque components
     updateServerCommand(libfranka_robot_state, torque_commanded_);
     checkStateLimits(libfranka_robot_state, torque_safety_);
@@ -147,7 +191,14 @@ void FrankaTorqueControlClient::run() {
                                                            torque_applied_[i]);
     }
 
+    flight_recorder_->record(libfranka_robot_state, torque_commanded_, torque_applied_,
+                             started, last_rpc_ms_, period.toMSec(), true, servo_reference_);
     return torque_applied_;
+    } catch (...) {
+      flight_recorder_->record(libfranka_robot_state, torque_commanded_, torque_applied_,
+                               started, last_rpc_ms_, period.toMSec(), false, servo_reference_);
+      throw;
+    }
   };
 
   // Run robot
@@ -158,9 +209,19 @@ void FrankaTorqueControlClient::run() {
       try {
         robot_ptr_->control(control_callback, limit_rate_, lpf_cutoff_freq_);
       } catch (const std::exception &ex) {
+        try {
+          auto control_error = dynamic_cast<const franka::ControlException*>(&ex);
+          if (control_error) flight_recorder_->dump(ex.what(), control_error->log);
+          else flight_recorder_->dump(ex.what());
+        } catch (const std::exception& log_error) {
+          spdlog::error("Fault recording failed: {}", log_error.what());
+        }
         spdlog::error("Robot is unable to be controlled: {}", ex.what());
         is_robot_operational = false;
       }
+
+      // Restart requires operator inspection unless recovery was explicitly enabled.
+      if (!automatic_recovery_ || is_robot_operational) break;
 
       // Automatic recovery
       spdlog::warn("Performing automatic error recovery. This calls "
@@ -188,16 +249,13 @@ void FrankaTorqueControlClient::run() {
 
   } else {
     // Run mocked robot control loops
-    franka::RobotState robot_state;
-    franka::Duration duration;
+    franka::RobotState robot_state{};
+    franka::Duration duration(1);
 
-    int period = 1.0 / FRANKA_HZ;
-    int period_ns = period * 1.0e9;
-
-    struct timespec abs_target_time;
+    const auto period = std::chrono::nanoseconds(1000000);
+    auto next = std::chrono::steady_clock::now();
     while (true) {
-      clock_gettime(CLOCK_REALTIME, &abs_target_time);
-      abs_target_time.tv_nsec += period_ns;
+      next += period;
 
       // Pull data from robot if in readonly mode
       if (readonly_mode_) {
@@ -208,7 +266,9 @@ void FrankaTorqueControlClient::run() {
       // in readonly mode)
       control_callback(robot_state, duration);
 
-      clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &abs_target_time, nullptr);
+      const auto now = std::chrono::steady_clock::now();
+      if (next < now) next = now + period;
+      std::this_thread::sleep_until(next);
     }
   }
 }
@@ -254,9 +314,12 @@ void FrankaTorqueControlClient::updateServerCommand(
 
   // Retrieve torques
   grpc::ClientContext context;
-  long int pre_update_ns = getNanoseconds();
+  context.set_deadline(std::chrono::system_clock::now() +
+      std::chrono::microseconds(static_cast<long>(rpc_timeout_ms_ * 1000)));
+  long int pre_update_ns = polymetis_runtime::monotonic_ns();
   status_ = stub_->ControlUpdate(&context, robot_state_, &torque_command_);
-  long int post_update_ns = getNanoseconds();
+  long int post_update_ns = polymetis_runtime::monotonic_ns();
+  last_rpc_ms_ = double(post_update_ns - pre_update_ns) / 1e6;
   if (!status_.ok()) {
     std::string error_msg = "ControlUpdate rpc failed. ";
     throw std::runtime_error(error_msg + status_.error_message());
@@ -265,7 +328,25 @@ void FrankaTorqueControlClient::updateServerCommand(
   robot_state_.set_prev_controller_latency_ms(
       float(post_update_ns - pre_update_ns) / 1e6);
 
-  assert(torque_command_.joint_torques_size() == NUM_DOFS);
+  if (torque_command_.has_servo_reference()) {
+    if (torque_command_.joint_position_reference_size() != NUM_DOFS ||
+        torque_command_.joint_velocity_reference_size() != NUM_DOFS ||
+        torque_command_.joint_acceleration_reference_size() != NUM_DOFS)
+      throw std::runtime_error("Invalid servo reference dimensions");
+    servo_reference_.valid = true;
+    servo_reference_.status = torque_command_.servo_status();
+    for (int i = 0; i < NUM_DOFS; ++i) {
+      servo_reference_.q[i] = torque_command_.joint_position_reference(i);
+      servo_reference_.dq[i] = torque_command_.joint_velocity_reference(i);
+      servo_reference_.ddq[i] = torque_command_.joint_acceleration_reference(i);
+    }
+  }
+
+  if (torque_command_.joint_torques_size() != NUM_DOFS)
+    throw std::runtime_error("ControlUpdate returned an invalid torque dimension");
+  for (int i = 0; i < NUM_DOFS; ++i)
+    if (!std::isfinite(torque_command_.joint_torques(i)))
+      throw std::runtime_error("ControlUpdate returned non-finite torques");
   for (int i = 0; i < NUM_DOFS; i++) {
     torque_out[i] = torque_command_.joint_torques(i);
     robot_state_.set_prev_joint_torques_computed(
@@ -280,7 +361,7 @@ void FrankaTorqueControlClient::checkStateLimits(
    * Compute robot state limit violations and apply safety mechanisms.
    */
   std::array<double, 3> ee_pos_buf, force_buf;
-  std::array<double, 1> elbow_vel_buf, elbow_lim_buf, dummy;
+  std::array<double, 1> elbow_vel_buf{}, elbow_lim_buf{}, dummy{};
 
   // No safety checks in mock mode
   if (mock_franka_) {
@@ -309,11 +390,11 @@ void FrankaTorqueControlClient::checkStateLimits(
       jacobian_array.data());
   Eigen::Map<const Eigen::Vector3d> force_xyz_vec(force_buf.data());
 
-  Eigen::VectorXd force_vec(6);
+  Eigen::Matrix<double, 6, 1> force_vec;
   force_vec.head(3) << force_xyz_vec;
   force_vec.tail(3) << Eigen::Vector3d::Zero();
 
-  Eigen::VectorXd torque_vec(NUM_DOFS);
+  Eigen::Matrix<double, NUM_DOFS, 1> torque_vec;
   torque_vec << jacobian.transpose() * force_vec;
   Eigen::VectorXd::Map(&torque_out[0], NUM_DOFS) = torque_vec;
 
@@ -380,6 +461,8 @@ void FrankaTorqueControlClient::computeSafetyReflex(
 
   // Check limits & compute safety controller
   for (int i = 0; i < N; i++) {
+    if (!std::isfinite(values[i]))
+      throw std::runtime_error("Non-finite robot feedback");
     upper_violation = values[i] - upper_limit[i];
     lower_violation = lower_sign * lower_limit[i] - values[i];
 
@@ -399,14 +482,11 @@ void FrankaTorqueControlClient::computeSafetyReflex(
                      item_name_str, i, lower_sign * lower_limit[i],
                      upper_limit[i], values[i]);
 
-        std::string error_str =
-            "Safety limits exceeded in FrankaTorqueControlClient. ";
-        if (!readonly_mode_) {
-          throw std::runtime_error(error_str + "\n");
-        } else {
-          spdlog::warn(error_str + "Ignoring issue during readonly mode.");
-        }
       }
+      // Logging is deduplicated; enforcement must happen on EVERY violation,
+      // including the first cycle after automatic recovery.
+      if (!readonly_mode_)
+        throw std::runtime_error("Safety limits exceeded in FrankaTorqueControlClient");
     }
 
     // Check soft limits & compute feedback forces (safety controller)
@@ -440,6 +520,7 @@ void *rt_main(void *cfg_ptr) {
   return NULL;
 }
 
+#ifndef POLYMETIS_CLIENT_NO_MAIN
 int main(int argc, char *argv[]) {
   if (argc != 2) {
     spdlog::error("Usage: franka_panda_client /path/to/cfg.yaml");
@@ -456,3 +537,5 @@ int main(int argc, char *argv[]) {
 
   return 0;
 }
+
+#endif
