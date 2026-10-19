@@ -52,6 +52,11 @@ foreach(client franka_panda_client franka_hand_client)
 endforeach()
 
 enable_testing()
+add_executable(gripper_command_test gripper_command_test.cpp)
+target_include_directories(gripper_command_test PRIVATE "${POLYMETIS_ROOT}/include")
+target_link_options(gripper_command_test PRIVATE "-Wl,-rpath-link,${POLYMETIS_MODEL_LIBDIR}")
+target_link_libraries(gripper_command_test PRIVATE "${POLYMETIS_MODEL_LIBDIR}/libhpp-fcl.so" Franka::Franka spdlog::spdlog pthread)
+add_test(NAME gripper_command_failure COMMAND gripper_command_test)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME gripper_readonly_guard COMMAND "${Python3_EXECUTABLE}"
   "${CMAKE_CURRENT_SOURCE_DIR}/check_gripper_readonly.py" "$<TARGET_FILE:franka_hand_client>")

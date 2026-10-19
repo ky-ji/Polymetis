@@ -1,4 +1,5 @@
 #include "polymetis/clients/franka_hand_client.hpp"
+#include "polymetis/clients/gripper_command.hpp"
 
 #include "spdlog/spdlog.h"
 #include <string>
@@ -62,8 +63,9 @@ bool FrankaHandClient::applyGripperCommand(GripperCommand command) {
   if (readonly_mode_) throw std::runtime_error("Read-only gripper cannot execute a command");
 
   if (command.grasp()) {
-    spdlog::info("Grasping at width {} at speed={}", command.width(),
-                 command.speed());
+    spdlog::info("Grasping at width {} at speed={} force={} N epsilon_inner={} epsilon_outer={}",
+                 command.width(), command.speed(), command.force(),
+                 command.epsilon_inner(), command.epsilon_outer());
     double eps_inner = (command.epsilon_inner() < 0)
                            ? EPSILON_INNER
                            : command.epsilon_inner();
@@ -85,11 +87,7 @@ void FrankaHandClient::run(void) {
   const auto period = std::chrono::nanoseconds(1000000000LL / GRIPPER_HZ);
   auto next = std::chrono::steady_clock::now();
   while (true) {
-    if (command_future_.valid() &&
-        command_future_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-      prev_cmd_successful_ = command_future_.get();
-      is_moving_ = false;
-    }
+    pollGripperCommand(command_future_, prev_cmd_successful_, is_moving_);
     // Run control step
     getGripperState();
 
