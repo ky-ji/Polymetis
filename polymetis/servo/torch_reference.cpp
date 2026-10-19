@@ -40,6 +40,13 @@ class TorchJointReference : public torch::CustomClassHolder {
     return config_.clone();
   }
 
+  bool terminated() const {
+    // Keep safety transitions free of first-use Tensor kernels in the 1 kHz
+    // callback. This method is exercised on every normal and faulted cycle.
+    return engine_.status != 0 && std::all_of(engine_.velocity.begin(), engine_.velocity.end(),
+        [](double velocity) { return std::abs(velocity) < 1e-6; });
+  }
+
  private:
   static torch::Tensor validate(torch::Tensor config) {
     TORCH_CHECK(config.device().is_cpu() && config.dim() == 1 && config.size(0) == 51,
@@ -63,6 +70,7 @@ TORCH_LIBRARY(polymetis_servo, module) {
   module.class_<TorchJointReference>("JointReference")
       .def(torch::init<torch::Tensor>())
       .def("step", &TorchJointReference::step)
+      .def("terminated", &TorchJointReference::terminated)
       .def_pickle(
           [](const c10::intrusive_ptr<TorchJointReference>& self) { return self->initial_state(); },
           [](torch::Tensor config) { return c10::make_intrusive<TorchJointReference>(config); });

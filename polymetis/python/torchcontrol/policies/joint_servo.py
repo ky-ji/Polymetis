@@ -38,8 +38,7 @@ class JointServoControl(toco.PolicyModule):
     def forward(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         reference = self.reference.step(self.joint_pos_desired, int(self.command_sequence.item()),
                                         bool(self.command_paused.item() > 0.5))
-        if bool(reference[3][0] > 0) and bool(torch.max(torch.abs(reference[1])) < 1e-6):
-            self._terminated = True
+        self._terminated = self.reference.terminated()
         q = state_dict["joint_positions"]
         dq = state_dict["joint_velocities"]
         feedback = self.joint_pd(q, dq, reference[0], reference[1])

@@ -8,6 +8,10 @@
 #include "polymetis/polymetis_server.hpp"
 
 namespace {
+int64_t steady_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 bool cancelled(ServerContext* context) {
   return context->IsCancelled() || std::chrono::system_clock::now() >= context->deadline();
 }
@@ -175,6 +179,7 @@ Status
 PolymetisControllerServerImpl::ControlUpdate(ServerContext *context,
                                              const RobotState *robot_state,
                                              TorqueCommand *torque_command) {
+  const auto received_ns = steady_ns();
   if (!torch_robot_state_ || !robot_client_context_.default_controller)
     return Status(StatusCode::FAILED_PRECONDITION, "Robot client is not initialized");
   for (const auto* values : {&robot_state->joint_positions(), &robot_state->joint_velocities(),
@@ -277,6 +282,11 @@ PolymetisControllerServerImpl::ControlUpdate(ServerContext *context,
   robot_state_copy.mutable_joint_acceleration_reference()->CopyFrom(torque_command->joint_acceleration_reference());
   robot_state_copy.set_servo_status(torque_command->servo_status());
   robot_state_copy.set_has_servo_reference(torque_command->has_servo_reference());
+  const auto computed_ns = steady_ns();
+  robot_state_copy.set_server_received_monotonic_ns(received_ns);
+  robot_state_copy.set_server_computed_monotonic_ns(computed_ns);
+  torque_command->set_server_received_monotonic_ns(received_ns);
+  torque_command->set_server_computed_monotonic_ns(computed_ns);
   robot_state_buffer_.append(robot_state_copy);
 
   // Update timestep & check termination

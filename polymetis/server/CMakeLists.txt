@@ -46,3 +46,7 @@ add_executable(run_server "${POLYMETIS_ROOT}/src/run_server.cpp")
 target_link_libraries(run_server PRIVATE controller_server pthread)
 install(TARGETS run_server RUNTIME DESTINATION bin)
 install(FILES "${POLYMETIS_SERVO_LIBRARY}" DESTINATION lib)
+
+add_executable(control_latency_probe control_latency_probe.cpp)
+target_include_directories(control_latency_probe PRIVATE "${POLYMETIS_ROOT}/include")
+target_link_libraries(control_latency_probe PRIVATE runtime_proto pthread)

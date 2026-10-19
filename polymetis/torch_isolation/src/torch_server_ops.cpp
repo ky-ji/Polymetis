@@ -8,6 +8,7 @@
 #include <torch/jit.h>
 #include <torch/script.h>
 #include <torch/torch.h>
+#include <torch/csrc/jit/runtime/graph_executor.h>
 #include <vector>
 
 extern "C" {
@@ -134,6 +135,9 @@ TorchScriptedController::~TorchScriptedController() {
 
 std::vector<float> TorchScriptedController::forward(TorchRobotState &input) {
   torch::NoGradGuard no_grad;
+  // An unseen safety branch must not trigger JIT profiling or specialization
+  // inside a realtime callback. Warmup cannot exercise every runtime branch.
+  torch::jit::GraphOptimizerEnabledGuard no_optimization(false);
   // Step controller & generate torque command response
   c10::Dict<torch::jit::IValue, torch::jit::IValue> controller_state_dict =
       module_->data.forward(input.input_->data).toGenericDict();
@@ -174,10 +178,12 @@ void TorchScriptedController::warmup_controller(
 }
 
 bool TorchScriptedController::is_terminated() {
+  torch::jit::GraphOptimizerEnabledGuard no_optimization(false);
   return module_->data.get_method("is_terminated")(empty_input_->data).toBool();
 }
 
 void TorchScriptedController::reset() {
+  torch::jit::GraphOptimizerEnabledGuard no_optimization(false);
   module_->data.get_method("reset")(empty_input_->data);
 }
 

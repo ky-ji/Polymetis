@@ -150,6 +150,9 @@ message RobotState {
   repeated float joint_acceleration_reference = 15;
   int32 servo_status = 16;
   bool has_servo_reference = 17;
+  int64 native_request_monotonic_ns = 18;
+  int64 server_received_monotonic_ns = 19;
+  int64 server_computed_monotonic_ns = 20;
 }
 
 message TorqueCommand {
@@ -161,6 +164,8 @@ message TorqueCommand {
   repeated float joint_acceleration_reference = 5;
   int32 servo_status = 6;
   bool has_servo_reference = 7;
+  int64 server_received_monotonic_ns = 8;
+  int64 server_computed_monotonic_ns = 9;
 }
 
 message Empty {}

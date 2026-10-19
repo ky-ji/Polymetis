@@ -55,7 +55,17 @@ class JointReference {
         for (std::size_t i = 0; i < 7; ++i)
           valid = valid && std::isfinite(target[i]) && target[i] >= lower_[i] && target[i] <= upper_[i];
         if (!valid) latch(2);
-        else if (!plan(target, false)) latch(3);
+        else if (!plan(target, false)) {
+          if (last_plan_error == -1024) {
+            // A reachable endpoint can still imply overshoot from the current
+            // velocity/acceleration. Reject that replacement and finish the
+            // previously validated trajectory; a later inward target can resume
+            // immediately. Never expand bounds or reset motion derivatives.
+            ++boundary_rejections;
+          } else {
+            latch(3);
+          }
+        }
       }
     }
     if (paused) received_at_ = now_ns;
@@ -69,6 +79,7 @@ class JointReference {
   // 5 clock regression. A fault never automatically re-enables input.
   int status = 0;
   int last_plan_error = 0;
+  std::uint64_t boundary_rejections = 0;
 
  private:
   bool plan(const Vector& target, bool stop) {
@@ -90,6 +101,7 @@ class JointReference {
       if (extrema[i].min < lower_[i] - 1e-10 || extrema[i].max > upper_[i] + 1e-10) { last_plan_error = -1024; return false; }
     trajectory_ = candidate;
     elapsed_ = 0;
+    last_plan_error = 0;
     return true;
   }
 
