@@ -31,6 +31,10 @@ def main():
     parser.add_argument("--duration", type=float, default=1.0)
     parser.add_argument("--realtime", action="store_true")
     parser.add_argument("--ee-link", default="fr3_link8")
+    parser.add_argument("--lookahead-s", type=float, default=0.0)
+    parser.add_argument("--max-velocity", type=float, default=0.25)
+    parser.add_argument("--max-acceleration", type=float, default=0.9)
+    parser.add_argument("--max-jerk", type=float, default=6.0)
     args = parser.parse_args()
     torch.set_num_threads(1)
     torch.ops.load_library(str(args.servo_library))
@@ -92,7 +96,8 @@ def main():
         model = RobotModelPinocchio(str(args.urdf), args.ee_link)
         low, high = model.get_joint_angle_limits()
         policy = JointServoControl(q, zero, [40.] * 7, [8.] * 7, low + .1, high - .1,
-                                   [.25] * 7, [.9] * 7, [6.] * 7, model)
+                                   [args.max_velocity] * 7, [args.max_acceleration] * 7,
+                                   [args.max_jerk] * 7, model, lookahead_s=args.lookahead_s)
         episode = stub.SetController(BaseRobotInterface._get_msg_generator(torch.jit.script(policy))(), timeout=3)
 
         def update(sequence, paused):
@@ -123,15 +128,17 @@ def main():
         assert len(rows) > 100
         positions, velocity, acceleration = (np.array([row[i] for row in rows]) for i in range(3))
         assert np.all(positions >= np.array(low) - 1e-6) and np.all(positions <= np.array(high) + 1e-6)
-        assert np.abs(velocity).max() <= .25001 and np.abs(acceleration).max() <= .90001
+        assert np.abs(velocity).max() <= args.max_velocity + 1e-5
+        assert np.abs(acceleration).max() <= args.max_acceleration + 1e-5
         jerk = np.abs(np.diff(acceleration, axis=0) / .001).max()
-        assert jerk <= 6.01, jerk
+        assert jerk <= args.max_jerk + .01, jerk
         assert any(row[3] == 1 for row in rows), "stale status missing from telemetry"
         result = {"synthetic_feedback_only": True, "samples": len(rows), "max_reference_jerk": float(jerk),
                   "intentional_pause_resumes": True, "stale_input_brakes_and_terminates": True,
                   "reference_telemetry_received": True,
                   "rpc_roundtrip_us_p99": float(np.percentile([r[4] for r in rows][10:], 99)),
-                  "rpc_roundtrip_us_max": max(r[4] for r in rows), "typed_targets": args.typed_targets}
+                  "rpc_roundtrip_us_max": max(r[4] for r in rows), "typed_targets": args.typed_targets,
+                  "lookahead_s": args.lookahead_s}
         if args.typed_targets:
             episode = stub.SetController(BaseRobotInterface._get_msg_generator(torch.jit.script(policy))(), timeout=3)
             bad = pb.JointTarget(episode_start=episode.start + 1, sequence=1, position=q.tolist())

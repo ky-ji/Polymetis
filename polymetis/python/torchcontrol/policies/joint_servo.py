@@ -15,7 +15,8 @@ class JointServoControl(toco.PolicyModule):
     """
 
     def __init__(self, q, dq, Kp, Kd, lower, upper, max_velocity,
-                 max_acceleration, max_jerk, robot_model, dt=0.001, timeout=0.15):
+                 max_acceleration, max_jerk, robot_model, dt=0.001, timeout=0.15,
+                 lookahead_s=0.0):
         super().__init__()
         arrays = [torch.as_tensor(v, dtype=torch.float32).reshape(7)
                   for v in (q, dq, Kp, Kd, lower, upper, max_velocity, max_acceleration, max_jerk)]
@@ -27,6 +28,10 @@ class JointServoControl(toco.PolicyModule):
         config = torch.cat([q.double(), dq.double(), low.double(), high.double(),
                             vmax.double(), amax.double(), jmax.double(),
                             torch.tensor([dt, timeout], dtype=torch.float64)])
+        # Preserve the original serialized configuration when prediction is off.
+        # An old native library rejects the extended configuration explicitly.
+        if lookahead_s != 0.0:
+            config = torch.cat([config, torch.tensor([lookahead_s], dtype=torch.float64)])
         self.reference = torch.classes.polymetis_servo.JointReference(config)
         self.joint_pos_desired = torch.nn.Parameter(q.clone())
         self.command_paused = torch.nn.Parameter(torch.ones(1))
