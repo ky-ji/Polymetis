@@ -23,6 +23,10 @@ service PolymetisControllerServer {
   // where update takes effect
   rpc UpdateController(stream ControllerChunk) returns(LogInterval) {}
 
+  // Latest joint-servo target, consumed on the next control cycle. No model
+  // deserialization occurs here. The episode and sequence prevent stale writes.
+  rpc UpdateJointTarget(JointTarget) returns(LogInterval) {}
+
   // Terminate the current controller, and return the log indices at
   // start & end of controller execution
   rpc TerminateController(Empty) returns(LogInterval) {}
@@ -102,6 +106,13 @@ message ControllerChunk {
   bytes torchscript_binary_chunk = 1;
 }
 
+message JointTarget {
+  int32 episode_start = 1;
+  int64 sequence = 2;
+  repeated float position = 3;
+  bool paused = 4;
+}
+
 message RobotClientMetadata {
   string urdf_file = 1;
   int32 hz = 2;
@@ -115,6 +126,7 @@ message RobotClientMetadata {
   string polymetis_version = 10;
   repeated float default_Kx = 11;
   repeated float default_Kxd = 12;
+  bool supports_joint_target_rpc = 13;
 }
 
 message RobotState {

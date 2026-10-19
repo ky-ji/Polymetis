@@ -7,6 +7,7 @@
 
 #include "spdlog/spdlog.h"
 #include <chrono>
+#include <atomic>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -55,11 +56,11 @@ enum ControllerStatus {
 TODO
 */
 struct CustomControllerContext {
-  uint episode_begin = -1;
-  uint episode_end = -1;
+  std::atomic<int> episode_begin{-1};
+  std::atomic<int> episode_end{-1};
   uint timestep = 0;
-  ControllerStatus status = UNINITIALIZED;
-  std::mutex controller_mtx;
+  std::atomic<ControllerStatus> status{UNINITIALIZED};
+  PriorityMutex controller_mtx;
   std::unique_ptr<TorchScriptedController> custom_controller;
 };
 
@@ -67,9 +68,9 @@ struct CustomControllerContext {
 TODO
 */
 struct RobotClientContext {
-  long int last_update_ns = 0;
+  std::atomic<long int> last_update_ns{0};
   RobotClientMetadata metadata;
-  TorchScriptedController *default_controller = nullptr;
+  std::unique_ptr<TorchScriptedController> default_controller;
 };
 
 /**
@@ -147,6 +148,9 @@ public:
                           ServerReader<ControllerChunk> *stream,
                           LogInterval *interval) override;
 
+  Status UpdateJointTarget(ServerContext *context, const JointTarget *target,
+                           LogInterval *interval) override;
+
   /**
   TODO
   */
@@ -166,7 +170,10 @@ private:
   int num_dofs_;
   long int threshold_ns_ = THRESHOLD_NS;
 
-  std::mutex service_mtx_;
+  PriorityMutex service_mtx_;
+  std::array<float, 7> pending_target_{};
+  int64_t target_sequence_ = -1;
+  bool target_pending_ = false, target_paused_ = true;
 
   CircularBuffer<RobotState> robot_state_buffer_ =
       CircularBuffer<RobotState>(MAX_CIRCULAR_BUFFER_SIZE);

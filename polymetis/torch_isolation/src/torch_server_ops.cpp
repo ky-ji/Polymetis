@@ -205,4 +205,15 @@ void TorchScriptedController::param_dict_update_module() {
   module_->data.get_method("update")(param_dict_input_->data);
 }
 
+void TorchScriptedController::update_joint_target(const std::array<float, 7>& target,
+                                                  int64_t sequence, bool paused) {
+  torch::NoGradGuard no_grad;
+  auto position = module_->data.attr("joint_pos_desired").toTensor();
+  TORCH_CHECK(position.numel() == 7 && position.scalar_type() == torch::kFloat32 && position.is_contiguous(),
+              "joint servo requires seven contiguous float32 targets");
+  std::copy(target.begin(), target.end(), position.data_ptr<float>());
+  module_->data.attr("command_sequence").toTensor().fill_(sequence);
+  module_->data.attr("command_paused").toTensor().fill_(paused ? 1.0 : 0.0);
+}
+
 } /* extern "C" */

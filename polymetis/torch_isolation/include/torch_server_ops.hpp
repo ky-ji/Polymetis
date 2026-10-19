@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <vector>
 
@@ -69,6 +70,7 @@ public:
   bool has_servo_reference() const { return has_servo_reference_; }
   bool param_dict_load(char *data, size_t size);
   void param_dict_update_module();
+  void update_joint_target(const std::array<float, 7>& target, int64_t sequence, bool paused);
 
   bool is_terminated();
   void reset();

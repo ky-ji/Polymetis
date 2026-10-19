@@ -7,6 +7,26 @@
 
 #include "polymetis/polymetis_server.hpp"
 
+namespace {
+bool cancelled(ServerContext* context) {
+  return context->IsCancelled() || std::chrono::system_clock::now() >= context->deadline();
+}
+bool acquire(std::unique_lock<PriorityMutex>& lock, ServerContext* context) {
+  while (!cancelled(context)) {
+    if (lock.try_lock_for(std::chrono::milliseconds(2))) return !cancelled(context);
+  }
+  return false;
+}
+class ScopedPriority {
+ public:
+  ScopedPriority(PolymetisControllerServerImpl& owner) : owner_(owner), old_(owner.setThreadPriority(RT_LOW_PRIO)) {}
+  ~ScopedPriority() { owner_.setThreadPriority(old_); }
+ private:
+  PolymetisControllerServerImpl& owner_;
+  int old_;
+};
+}
+
 PolymetisControllerServerImpl::PolymetisControllerServerImpl() {
   controller_model_buffer_.reserve(MAX_MODEL_BYTES);
   updates_model_buffer_.reserve(MAX_MODEL_BYTES);
@@ -15,11 +35,12 @@ PolymetisControllerServerImpl::PolymetisControllerServerImpl() {
 Status PolymetisControllerServerImpl::GetRobotState(ServerContext *context,
                                                     const Empty *,
                                                     RobotState *robot_state) {
-  if (robot_state_buffer_.size() == 0) {
+  const auto latest = robot_state_buffer_.get(static_cast<long>(robot_state_buffer_.size()) - 1);
+  if (!latest) {
     return Status(StatusCode::FAILED_PRECONDITION,
                   "Cannot retrieve robot state from empty buffer!");
   }
-  *robot_state = *robot_state_buffer_.get(robot_state_buffer_.size() - 1);
+  *robot_state = *latest;
   return Status::OK;
 }
 
@@ -31,6 +52,7 @@ Status PolymetisControllerServerImpl::GetRobotClientMetadata(
         "Robot context not valid when calling GetRobotClientMetadata!");
   }
   *metadata = robot_client_context_.metadata;
+  metadata->set_supports_joint_target_rpc(true);
   return Status::OK;
 }
 
@@ -41,9 +63,9 @@ Status PolymetisControllerServerImpl::GetRobotStateStream(
     if (i >= robot_state_buffer_.size()) {
       usleep(SPIN_INTERVAL_USEC);
     } else {
-      RobotState *robot_state_ptr = robot_state_buffer_.get(i);
-      if (robot_state_ptr != NULL) {
-        writer->Write(RobotState(*robot_state_ptr));
+      auto robot_state_ptr = robot_state_buffer_.get(i);
+      if (robot_state_ptr) {
+        if (!writer->Write(*robot_state_ptr)) break;
       }
       i++;
     }
@@ -62,9 +84,9 @@ Status PolymetisControllerServerImpl::GetRobotStateLog(
 
   // Stream interval from robot state buffer
   for (uint i = interval->start(); i <= end; i++) {
-    RobotState *robot_state_ptr = robot_state_buffer_.get(i);
-    if (robot_state_ptr != NULL) {
-      writer->Write(RobotState(*robot_state_ptr));
+    auto robot_state_ptr = robot_state_buffer_.get(i);
+    if (robot_state_ptr) {
+      if (!writer->Write(*robot_state_ptr)) break;
     }
 
     // Break if request cancelled
@@ -80,6 +102,10 @@ Status PolymetisControllerServerImpl::InitRobotClient(
     Empty *) {
   spdlog::info("==== Initializing new RobotClient... ====");
 
+  std::unique_lock<PriorityMutex> service_lock(service_mtx_, std::defer_lock);
+  if (!acquire(service_lock, context)) return Status(StatusCode::DEADLINE_EXCEEDED, "Initialization cancelled");
+  std::lock_guard<PriorityMutex> controller_lock(custom_controller_context_.controller_mtx);
+
   num_dofs_ = robot_client_metadata->dof();
 
   torch_robot_state_ =
@@ -94,7 +120,7 @@ Status PolymetisControllerServerImpl::InitRobotClient(
 
   // Load default controller from model buffer
   try {
-    robot_client_context_.default_controller = new TorchScriptedController(
+    robot_client_context_.default_controller = std::make_unique<TorchScriptedController>(
         controller_model_buffer_.data(), controller_model_buffer_.size(),
         *torch_robot_state_);
   } catch (const std::exception &e) {
@@ -125,6 +151,8 @@ bool PolymetisControllerServerImpl::validRobotContext() {
 }
 
 void PolymetisControllerServerImpl::resetControllerContext() {
+  target_sequence_ = -1;
+  target_pending_ = false;
   custom_controller_context_.episode_begin = -1;
   custom_controller_context_.episode_end = -1;
   custom_controller_context_.timestep = 0;
@@ -159,6 +187,8 @@ PolymetisControllerServerImpl::ControlUpdate(ServerContext *context,
   }
 
   // Check if last update is stale
+  std::unique_lock<PriorityMutex> controller_lock(custom_controller_context_.controller_mtx, std::defer_lock);
+  if (!acquire(controller_lock, context)) return Status(StatusCode::DEADLINE_EXCEEDED, "Control lock deadline");
   if (!validRobotContext()) {
     spdlog::warn("Interrupted control update greater than threshold of {} ns. "
                  "Reverting to default controller...",
@@ -181,7 +211,6 @@ PolymetisControllerServerImpl::ControlUpdate(ServerContext *context,
   // Lock to prevent 1) controller updates while controller is running; 2)
   // external termination during controller selection, which might cause loading
   // of a uninitialized default controller
-  custom_controller_context_.controller_mtx.lock();
 
   // Update episode markers
   if (custom_controller_context_.status == READY) {
@@ -205,13 +234,16 @@ PolymetisControllerServerImpl::ControlUpdate(ServerContext *context,
   if (custom_controller_context_.status == RUNNING) {
     controller = custom_controller_context_.custom_controller.get();
   } else {
-    controller = robot_client_context_.default_controller;
+    controller = robot_client_context_.default_controller.get();
   }
   std::vector<float> desired_torque;
   try {
+    if (custom_controller_context_.status == RUNNING && target_pending_) {
+      controller->update_joint_target(pending_target_, target_sequence_, target_paused_);
+      target_pending_ = false;
+    }
     desired_torque = controller->forward(*torch_robot_state_);
   } catch (const std::exception &e) {
-    custom_controller_context_.controller_mtx.unlock();
     std::string error_msg =
         "Failed to run controller forward function: " + std::string(e.what());
     spdlog::error(error_msg);
@@ -229,8 +261,6 @@ PolymetisControllerServerImpl::ControlUpdate(ServerContext *context,
     }
     torque_command->set_servo_status(static_cast<int>(reference[21]));
   }
-  // Unlock
-  custom_controller_context_.controller_mtx.unlock();
   for (int i = 0; i < num_dofs_; i++) {
     torque_command->add_joint_torques(desired_torque[i]);
   }
@@ -265,9 +295,10 @@ PolymetisControllerServerImpl::ControlUpdate(ServerContext *context,
 Status PolymetisControllerServerImpl::SetController(
     ServerContext *context, ServerReader<ControllerChunk> *stream,
     LogInterval *interval) {
-  std::lock_guard<std::mutex> service_lock(service_mtx_);
-
-  int orig_prio = setThreadPriority(RT_LOW_PRIO);
+  ScopedPriority priority(*this);
+  std::unique_lock<PriorityMutex> service_lock(service_mtx_, std::defer_lock);
+  if (!acquire(service_lock, context)) return Status(StatusCode::DEADLINE_EXCEEDED, "Controller upload cancelled");
+  if (!validRobotContext()) return Status(StatusCode::FAILED_PRECONDITION, "Robot feedback is stale");
 
   interval->set_start(-1);
   interval->set_end(-1);
@@ -285,21 +316,31 @@ Status PolymetisControllerServerImpl::SetController(
   }
 
   try {
+    // Warm up against a private snapshot, never tensors concurrently mutated by control.
+    auto state = robot_state_buffer_.get(static_cast<long>(robot_state_buffer_.size()) - 1);
+    if (!state) return Status(StatusCode::FAILED_PRECONDITION, "No robot feedback");
+    TorchRobotState warmup(num_dofs_);
+    warmup.update_state(state->timestamp().seconds(), state->timestamp().nanos(),
+        {state->joint_positions().begin(), state->joint_positions().end()},
+        {state->joint_velocities().begin(), state->joint_velocities().end()},
+        {state->motor_torques_measured().begin(), state->motor_torques_measured().end()},
+        {state->motor_torques_external().begin(), state->motor_torques_external().end()});
     // Load new controller
     auto new_controller = std::make_unique<TorchScriptedController>(
         controller_model_buffer_.data(), controller_model_buffer_.size(),
-        *torch_robot_state_);
+        warmup);
 
     // Switch in new controller by updating controller context
     // (note: use std::swap to put ptr to old controller in new_controller,
     // which destructs automatically after going out of scope)
-    custom_controller_context_.controller_mtx.lock();
+    std::unique_lock<PriorityMutex> lock(custom_controller_context_.controller_mtx, std::defer_lock);
+    if (!acquire(lock, context)) return Status(StatusCode::DEADLINE_EXCEEDED, "Controller upload expired");
 
     resetControllerContext();
     std::swap(custom_controller_context_.custom_controller, new_controller);
     custom_controller_context_.status = READY;
 
-    custom_controller_context_.controller_mtx.unlock();
+    lock.unlock();
     spdlog::info("Loaded new controller.");
 
   } catch (const std::exception &e) {
@@ -311,19 +352,23 @@ Status PolymetisControllerServerImpl::SetController(
 
   // Respond with start index
   while (custom_controller_context_.status == READY) {
+    if (cancelled(context) || !validRobotContext())
+      return Status(StatusCode::DEADLINE_EXCEEDED, "No control cycle acknowledged controller upload");
     usleep(SPIN_INTERVAL_USEC);
   }
   interval->set_start(custom_controller_context_.episode_begin);
 
-  setThreadPriority(orig_prio);
   return Status::OK;
 }
 
 Status PolymetisControllerServerImpl::UpdateController(
     ServerContext *context, ServerReader<ControllerChunk> *stream,
     LogInterval *interval) {
-  std::lock_guard<std::mutex> service_lock(service_mtx_);
-  int orig_prio = setThreadPriority(RT_LOW_PRIO);
+  ScopedPriority priority(*this);
+  std::unique_lock<PriorityMutex> service_lock(service_mtx_, std::defer_lock);
+  if (!acquire(service_lock, context)) return Status(StatusCode::DEADLINE_EXCEEDED, "Controller update cancelled");
+  if (!validRobotContext() || custom_controller_context_.status != RUNNING)
+    return Status(StatusCode::FAILED_PRECONDITION, "No live controller");
 
   interval->set_start(-1);
   interval->set_end(-1);
@@ -349,13 +394,12 @@ Status PolymetisControllerServerImpl::UpdateController(
   // Update controller & set intervals
   if (custom_controller_context_.status == RUNNING) {
     try {
-      custom_controller_context_.controller_mtx.lock();
+      std::unique_lock<PriorityMutex> lock(custom_controller_context_.controller_mtx, std::defer_lock);
+      if (!acquire(lock, context)) return Status(StatusCode::DEADLINE_EXCEEDED, "Controller update expired");
       interval->set_start(robot_state_buffer_.size());
       custom_controller_context_.custom_controller->param_dict_update_module();
-      custom_controller_context_.controller_mtx.unlock();
 
     } catch (const std::exception &e) {
-      custom_controller_context_.controller_mtx.unlock();
 
       std::string error_msg =
           "Failed to update controller: " + std::string(e.what());
@@ -370,24 +414,29 @@ Status PolymetisControllerServerImpl::UpdateController(
     return Status(StatusCode::CANCELLED, error_msg);
   }
 
-  setThreadPriority(orig_prio);
   return Status::OK;
 }
 
 Status PolymetisControllerServerImpl::TerminateController(
     ServerContext *context, const Empty *, LogInterval *interval) {
-  std::lock_guard<std::mutex> service_lock(service_mtx_);
+  ScopedPriority priority(*this);
+  std::unique_lock<PriorityMutex> service_lock(service_mtx_, std::defer_lock);
+  if (!acquire(service_lock, context)) return Status(StatusCode::DEADLINE_EXCEEDED, "Termination cancelled");
 
   interval->set_start(-1);
   interval->set_end(-1);
 
-  if (custom_controller_context_.status == RUNNING) {
-    custom_controller_context_.controller_mtx.lock();
-    custom_controller_context_.status = TERMINATING;
-    custom_controller_context_.controller_mtx.unlock();
+  if (custom_controller_context_.status == RUNNING || custom_controller_context_.status == TERMINATING) {
+    {
+      std::unique_lock<PriorityMutex> lock(custom_controller_context_.controller_mtx, std::defer_lock);
+      if (!acquire(lock, context)) return Status(StatusCode::DEADLINE_EXCEEDED, "Termination lock deadline");
+      custom_controller_context_.status = TERMINATING;
+    }
 
     // Respond with start & end index
     while (custom_controller_context_.status == TERMINATING) {
+      if (cancelled(context) || !validRobotContext())
+        return Status(StatusCode::DEADLINE_EXCEEDED, "Robot stopped before termination acknowledgement");
       usleep(SPIN_INTERVAL_USEC);
     }
     interval->set_start(custom_controller_context_.episode_begin);
@@ -400,6 +449,29 @@ Status PolymetisControllerServerImpl::TerminateController(
     return Status(StatusCode::CANCELLED, error_msg);
   }
 
+  return Status::OK;
+}
+
+Status PolymetisControllerServerImpl::UpdateJointTarget(
+    ServerContext* context, const JointTarget* target, LogInterval* interval) {
+  if (target->position_size() != 7 || target->sequence() < 0)
+    return Status(StatusCode::INVALID_ARGUMENT, "Seven joints and a nonnegative sequence are required");
+  for (float value : target->position())
+    if (!std::isfinite(value)) return Status(StatusCode::INVALID_ARGUMENT, "Joint target must be finite");
+  std::unique_lock<PriorityMutex> lock(custom_controller_context_.controller_mtx, std::defer_lock);
+  if (!acquire(lock, context)) return Status(StatusCode::DEADLINE_EXCEEDED, "Joint target expired");
+  if (!validRobotContext() || custom_controller_context_.status != RUNNING ||
+      custom_controller_context_.episode_begin != target->episode_start() ||
+      !custom_controller_context_.custom_controller->has_servo_reference())
+    return Status(StatusCode::FAILED_PRECONDITION, "Joint servo ownership is no longer valid");
+  if (target->sequence() <= target_sequence_)
+    return Status(StatusCode::INVALID_ARGUMENT, "Joint target sequence must advance");
+  std::copy(target->position().begin(), target->position().end(), pending_target_.begin());
+  target_sequence_ = target->sequence();
+  target_paused_ = target->paused();
+  target_pending_ = true;
+  interval->set_start(robot_state_buffer_.size());
+  interval->set_end(-1);
   return Status::OK;
 }
 
