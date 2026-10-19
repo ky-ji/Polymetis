@@ -53,6 +53,8 @@ endforeach()
 
 enable_testing()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME gripper_readonly_guard COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/check_gripper_readonly.py" "$<TARGET_FILE:franka_hand_client>")
 add_executable(runtime_test runtime_test.cpp "${POLYMETIS_ROOT}/src/clients/franka_panda_client/franka_panda_client.cpp")
 target_compile_definitions(runtime_test PRIVATE POLYMETIS_CLIENT_NO_MAIN)
 target_include_directories(runtime_test PRIVATE "${POLYMETIS_ROOT}/include")
