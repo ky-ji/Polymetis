@@ -44,6 +44,25 @@ def state(q=None):
     return {"joint_positions": torch.zeros(7) if q is None else q, "joint_velocities": torch.zeros(7)}
 
 
+def test_torque_budget_preserves_orientation_and_scales_translation_uniformly():
+    policy = make_policy(joint_torque_limits=[8.0] * 7)
+    primary = torch.tensor([6.0, -6.0, 0, 0, 0, 0, 0])
+    translation = torch.tensor([4.0, -2.0, 3.0, 0, 0, 0, 0])
+    total, scale = policy.add_with_budget(primary, translation)
+    assert float(scale) == 0.5
+    assert torch.allclose(total, primary + translation * 0.5)
+    assert bool((total.abs() <= 8).all())
+    total, scale = policy.add_with_budget(primary, -translation)
+    assert float(scale) == 1.0
+    assert torch.allclose(total, primary - translation)
+    # The complete scripted policy also honors the same output envelope.
+    scripted = torch.jit.script(make_policy(joint_torque_limits=[0.5] * 7))
+    for step in range(100):
+        command(scripted, step + 1)
+        output = scripted(state())
+        assert bool((output["joint_torques"].abs() <= 0.500001).all())
+
+
 def test_scripted_blocked_motion_has_bounded_error_and_no_normal_target_drift():
     policy = torch.jit.script(make_policy())
     for step in range(1000):

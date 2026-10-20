@@ -44,6 +44,7 @@ class PlanarImpedanceControl(toco.PolicyModule):
         free_normal_stiffness=300.0,
         free_normal_damping=15.0,
         free_normal_force_up=8.0,
+        joint_torque_limits=None,
     ):
         super().__init__()
 
@@ -114,6 +115,13 @@ class PlanarImpedanceControl(toco.PolicyModule):
         self.register_buffer("damping", kd)
         self.register_buffer("wrench_limits", limits)
         self.register_buffer("joint_damping", damping_q)
+        torque_limits = vector(
+            joint_torque_limits if joint_torque_limits is not None else [1e6] * 7,
+            7, "joint_torque_limits",
+        )
+        if not bool((torque_limits > 0).all()):
+            raise ValueError("joint_torque_limits must be positive")
+        self.register_buffer("joint_torque_limits", torque_limits)
         self.register_buffer("normal_reference", initial_table[2].clone())
         self.register_buffer("orientation_reference", orientation.detach().clone())
         self.register_buffer("reference_xy", initial_table[:2].clone())
@@ -161,6 +169,17 @@ class PlanarImpedanceControl(toco.PolicyModule):
             torch.minimum(torch.maximum(upper, reference), candidate),
         )
         return bounded, (bounded - reference) / self.dt
+
+    def add_with_budget(self, primary, secondary):
+        # Preserve the primary task direction; scale the secondary task as a
+        # whole rather than distorting it with independent joint clipping.
+        safe_denominator = torch.where(torch.abs(secondary) > 1e-6, secondary, torch.ones_like(secondary))
+        capacity = torch.where(secondary >= 0, self.joint_torque_limits - primary,
+                               -self.joint_torque_limits - primary)
+        fractions = torch.where(torch.abs(secondary) > 1e-6, capacity / safe_denominator,
+                                torch.ones_like(secondary))
+        scale = torch.clamp(torch.min(fractions), 0.0, 1.0)
+        return primary + scale * secondary, scale
 
     def forward(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         q = state_dict["joint_positions"]
@@ -266,12 +285,16 @@ class PlanarImpedanceControl(toco.PolicyModule):
         orientation_error = R.functional.quat2matrix(orientation) @ quaternion_error[:3]
         moment = self.stiffness[3:] * orientation_error - self.damping[3:] * twist[3:]
         moment = torch.maximum(-self.wrench_limits[3:], torch.minimum(self.wrench_limits[3:], moment))
-        wrench = torch.cat([self.table_rotation @ force_table, moment])
-        torque = jacobian.T @ wrench - self.joint_damping * dq
-        torque += self.invdyn(q, dq, torch.zeros_like(q))
+        bias = self.invdyn(q, dq, torch.zeros_like(q)) - self.joint_damping * dq
+        bias = torch.maximum(-self.joint_torque_limits, torch.minimum(self.joint_torque_limits, bias))
+        angular_torque, _ = self.add_with_budget(bias, jacobian[3:].T @ moment)
+        torque, translation_scale = self.add_with_budget(
+            angular_torque, jacobian[:3].T @ (self.table_rotation @ force_table)
+        )
         return {
             "joint_torques": torque,
             "planar_reference_xy": self.reference_xy.clone(),
             "planar_normal_wrench": force_table[2:3],
             "planar_reference_z": self.normal_reference.reshape(1).clone(),
+            "planar_translation_scale": translation_scale.reshape(1),
         }

@@ -69,7 +69,7 @@ def main():
         fields=('stiffness','damping','wrench_limits','max_speed','max_acceleration','velocity_time_constant',
             'max_tracking_error','normal_travel','preload','preload_ramp_s','joint_damping','timeout')
         optional=('start_in_contact','normal_bounds','normal_speed','normal_acceleration',
-            'free_normal_stiffness','free_normal_damping','free_normal_force_up')
+            'free_normal_stiffness','free_normal_damping','free_normal_force_up','joint_torque_limits')
         policy=PlanarImpedanceControl(q,model,torch.eye(3),low,high,
             **{k:config[k] for k in fields},**{k:config[k] for k in optional if k in config})
         stub.SetController(BaseRobotInterface._get_msg_generator(torch.jit.script(policy))(),timeout=5)
