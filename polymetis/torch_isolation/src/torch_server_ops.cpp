@@ -188,6 +188,8 @@ void TorchScriptedController::reset() {
 }
 
 bool TorchScriptedController::param_dict_load(char *data, size_t size) {
+  torch::NoGradGuard no_grad;
+  torch::jit::GraphOptimizerEnabledGuard no_optimization(false);
   memstream model_stream(data, size);
 
   torch::jit::script::Module param_dict_container;
@@ -208,6 +210,10 @@ bool TorchScriptedController::param_dict_load(char *data, size_t size) {
 }
 
 void TorchScriptedController::param_dict_update_module() {
+  // This method executes with the control mutex held. A first-use JIT
+  // specialization here blocks the 1 kHz control callback.
+  torch::NoGradGuard no_grad;
+  torch::jit::GraphOptimizerEnabledGuard no_optimization(false);
   module_->data.get_method("update")(param_dict_input_->data);
 }
 
