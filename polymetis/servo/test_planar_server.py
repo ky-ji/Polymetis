@@ -26,12 +26,13 @@ def main():
     ap.add_argument('--urdf', required=True)
     ap.add_argument('--config', required=True)
     ap.add_argument('--output', required=True)
+    ap.add_argument('--cpu', default='4', help='Never share the live arm server core')
     args = ap.parse_args()
     torch.set_num_threads(1)
     with socket.socket() as s:
         s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]
     log = open(args.output + '.log', 'wb')
-    process = subprocess.Popen(['taskset', '-c', '3', args.server, '-r', '-s', '127.0.0.1', '-p', str(port)], stdout=log, stderr=subprocess.STDOUT)
+    process = subprocess.Popen(['taskset', '-c', args.cpu, args.server, '-r', '-s', '127.0.0.1', '-p', str(port)], stdout=log, stderr=subprocess.STDOUT)
     channel = grpc.insecure_channel('127.0.0.1:' + str(port))
     stop = threading.Event(); rows = []; updates = []; errors = []; worker = None
     phase = ['startup']
@@ -60,12 +61,16 @@ def main():
                 due += .001; stop.wait(max(0,due-time.monotonic()))
         worker = threading.Thread(target=hardware);worker.start();time.sleep(.1)
         model = RobotModelPinocchio(args.urdf,config['ee_link_name']); position,_=model.forward_kinematics(q)
-        extent=torch.tensor(config['xy_half_extent'])
+        if 'xy_min' in config:
+            low,high=config['xy_min'],config['xy_max']
+        else:
+            extent=torch.tensor(config['xy_half_extent'])
+            low,high=position[:2]-extent,position[:2]+extent
         fields=('stiffness','damping','wrench_limits','max_speed','max_acceleration','velocity_time_constant',
             'max_tracking_error','normal_travel','preload','preload_ramp_s','joint_damping','timeout')
         optional=('start_in_contact','normal_bounds','normal_speed','normal_acceleration',
             'free_normal_stiffness','free_normal_damping','free_normal_force_up')
-        policy=PlanarImpedanceControl(q,model,torch.eye(3),position[:2]-extent,position[:2]+extent,
+        policy=PlanarImpedanceControl(q,model,torch.eye(3),low,high,
             **{k:config[k] for k in fields},**{k:config[k] for k in optional if k in config})
         stub.SetController(BaseRobotInterface._get_msg_generator(torch.jit.script(policy))(),timeout=5)
         phase[0]='paused';time.sleep(.2)

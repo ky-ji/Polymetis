@@ -146,6 +146,22 @@ class PlanarImpedanceControl(toco.PolicyModule):
         self.free_normal_damping = float(free_normal_damping)
         self.free_normal_force_up = float(free_normal_force_up)
 
+    def bounded_step(self, reference, measured, velocity, lower, upper, acceleration: float):
+        # Brake only the outward component. An overshoot must remain recoverable,
+        # including when a pause has reanchored the reference outside the box.
+        forward = torch.clamp(upper - torch.maximum(reference, measured), min=0.0)
+        backward = torch.clamp(torch.minimum(reference, measured) - lower, min=0.0)
+        velocity = torch.maximum(
+            -torch.sqrt(2.0 * acceleration * backward),
+            torch.minimum(torch.sqrt(2.0 * acceleration * forward), velocity),
+        )
+        candidate = reference + self.dt * velocity
+        bounded = torch.maximum(
+            torch.minimum(lower, reference),
+            torch.minimum(torch.maximum(upper, reference), candidate),
+        )
+        return bounded, (bounded - reference) / self.dt
+
     def forward(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         q = state_dict["joint_positions"]
         dq = state_dict["joint_velocities"]
@@ -171,20 +187,18 @@ class PlanarImpedanceControl(toco.PolicyModule):
             self.age += self.dt
         valid = bool(torch.isfinite(self.velocity_desired).all() and torch.isfinite(self.normal_velocity_desired).all())
         near_plane = not contact or bool(torch.abs(table_position[2] - self.normal_reference) <= self.normal_travel)
-        inside_workspace = bool(
-            ((self.xy_min <= table_position[:2]) & (table_position[:2] <= self.xy_max)).all()
-        ) and bool(self.normal_bounds[0] <= table_position[2] <= self.normal_bounds[1])
         paused = float(self.command_paused[0]) == 1.0
-        if paused and near_plane and inside_workspace:
+        if paused:
             self.restart_required = False
-        elif not near_plane or not inside_workspace or (self.was_active and (self.age >= self.timeout or not valid)):
+            if contact and not near_plane:
+                self.normal_reference.copy_(table_position[2])
+                near_plane = True
+        elif self.was_active and (self.age >= self.timeout or not valid):
             self.restart_required = True
         active = (
             valid
             and self.age < self.timeout
             and float(self.command_paused[0]) == 0.0
-            and near_plane
-            and inside_workspace
             and not self.restart_required
         )
         if not active or not self.was_active:
@@ -201,10 +215,11 @@ class PlanarImpedanceControl(toco.PolicyModule):
             delta = self.alpha * (target_velocity - self.velocity_xy)
             delta *= min(1.0, self.max_acceleration * self.dt / max(float(torch.norm(delta)), 1e-8))
             self.velocity_xy.add_(delta)
-            candidate = self.reference_xy + self.dt * self.velocity_xy
-            # Project outward commands; keep tangential motion along an edge.
-            bounded = torch.maximum(self.xy_min, torch.minimum(self.xy_max, candidate))
-            self.velocity_xy.copy_((bounded - self.reference_xy) / self.dt)
+            bounded, velocity = self.bounded_step(
+                self.reference_xy, table_position[:2], self.velocity_xy,
+                self.xy_min, self.xy_max, self.max_acceleration,
+            )
+            self.velocity_xy.copy_(velocity)
             error = bounded - table_position[:2]
             error *= min(1.0, self.max_tracking_error / max(float(torch.norm(error)), 1e-8))
             self.reference_xy.copy_(table_position[:2] + error)
@@ -214,11 +229,13 @@ class PlanarImpedanceControl(toco.PolicyModule):
                 change = torch.clamp(self.alpha * (desired_normal - self.normal_velocity),
                                      -self.normal_acceleration * self.dt, self.normal_acceleration * self.dt)
                 self.normal_velocity.add_(change)
-                candidate_z = torch.clamp(self.normal_reference + self.dt * self.normal_velocity[0],
-                                          self.normal_bounds[0], self.normal_bounds[1])
-                self.normal_velocity.copy_(((candidate_z - self.normal_reference) / self.dt).reshape(1))
+                candidate_z, velocity_z = self.bounded_step(
+                    self.normal_reference.reshape(1), table_position[2:3], self.normal_velocity,
+                    self.normal_bounds[:1], self.normal_bounds[1:], self.normal_acceleration,
+                )
+                self.normal_velocity.copy_(velocity_z)
                 self.normal_reference.copy_(table_position[2] + torch.clamp(
-                    candidate_z - table_position[2], -self.max_tracking_error, self.max_tracking_error))
+                    candidate_z[0] - table_position[2], -self.max_tracking_error, self.max_tracking_error))
         self.was_active = active
 
         position_error = torch.cat([
@@ -233,7 +250,7 @@ class PlanarImpedanceControl(toco.PolicyModule):
         elif not near_plane:
             # Do not seek the remembered surface after leaving its contact band.
             force_table[2] = -self.damping[2] * table_velocity[2]
-        if active and contact:
+        if active and contact and near_plane:
             force_table[2] -= self.preload * min(1.0, self.active_time / self.preload_ramp_s)
         upper_force = self.wrench_limits[:3].clone()
         if not contact:

@@ -86,7 +86,7 @@ def test_timeout_requires_pause_before_new_command_can_restart():
     assert float(output["planar_reference_xy"][0]) > 0
 
 
-def test_leaving_normal_band_does_not_seek_surface_or_resume_automatically():
+def test_leaving_normal_band_removes_surface_force_without_blocking_xy():
     policy = torch.jit.script(make_policy())
     command(policy, 1)
     policy(state())
@@ -94,10 +94,14 @@ def test_leaving_normal_band_does_not_seek_surface_or_resume_automatically():
     command(policy, 2)
     output = policy(state(lifted))
     assert float(output["planar_normal_wrench"][0]) == 0
-    command(policy, 3)
-    output = policy(state())
-    assert torch.allclose(output["planar_reference_xy"], torch.zeros(2))
+    command(policy, 3, velocity=(0.1, 0.1))
+    output = policy(state(lifted))
+    assert float(output["planar_reference_xy"][0]) > 0
+    assert float(output["planar_reference_xy"][1]) > 0
     assert float(output["planar_normal_wrench"][0]) == 0
+    command(policy, 4, paused=True)
+    output = policy(state(lifted))
+    assert float(output["planar_reference_z"][0]) == float(lifted[2])
 
 
 def test_workspace_edge_keeps_tangential_motion_and_rejects_outward_motion():
@@ -108,6 +112,65 @@ def test_workspace_edge_keeps_tangential_motion_and_rejects_outward_motion():
         output = policy(state(actual))
     assert abs(float(output["planar_reference_xy"][0]) - 0.1) < 1e-7
     assert float(output["planar_reference_xy"][1]) > 0
+
+
+def test_measured_xy_overshoot_allows_immediate_inward_and_tangential_motion():
+    for outside in (0.10052, 0.13):
+        policy = torch.jit.script(make_policy())
+        actual = torch.tensor([outside, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        command(policy, 1, paused=True)
+        policy(state(actual))
+        for step in range(60):
+            command(policy, step + 2, velocity=(-0.1, 0.1))
+            output = policy(state(actual))
+        assert float(output["planar_reference_xy"][0]) < outside - 0.0005
+        assert float(output["planar_reference_xy"][1]) > 0.0005
+        assert not policy.restart_required
+        # Recovery is a velocity command, not a snap to the box boundary.
+        assert float(torch.norm(policy.velocity_xy)) <= 0.2
+
+
+def test_actual_crossing_does_not_latch_or_block_the_other_axis():
+    policy = torch.jit.script(make_policy())
+    for step in range(100):
+        command(policy, step + 1, velocity=(0.1, 0.1))
+        x = 0.099 + step * 0.00002
+        actual = torch.tensor([x, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        output = policy(state(actual))
+    assert policy.was_active
+    assert not policy.restart_required
+    assert float(policy.velocity_xy[0]) == 0
+    assert float(output["planar_reference_xy"][1]) > 0.001
+
+
+def test_normal_overshoot_allows_downward_recovery_and_xy_commands():
+    policy = torch.jit.script(make_policy(start_in_contact=False))
+    actual = torch.tensor([0.0, 0.0, 0.2006, 0.0, 0.0, 0.0, 0.0])
+    command(policy, 1, paused=True)
+    policy(state(actual))
+    policy.update({"normal_velocity_desired": torch.tensor([-0.05])})
+    for step in range(100):
+        command(policy, step + 2, velocity=(0.1, 0))
+        output = policy(state(actual))
+    assert float(output["planar_reference_z"][0]) < float(actual[2]) - 0.001
+    assert float(output["planar_reference_xy"][0]) > 0.001
+    assert float(policy.normal_velocity[0]) >= -0.05
+    assert not policy.restart_required
+
+
+def test_braking_near_edge_preserves_inward_motion_without_latching():
+    policy = torch.jit.script(make_policy())
+    actual = torch.tensor([0.0995, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    for step in range(100):
+        command(policy, step + 1, velocity=(0.15, 0))
+        output = policy(state(actual))
+        assert float(output["planar_reference_xy"][0]) <= 0.100001
+        assert float(policy.velocity_xy[0]) <= (2 * 0.0005) ** 0.5 + 1e-5
+    for step in range(100):
+        command(policy, step + 101, velocity=(-0.15, 0))
+        output = policy(state(actual))
+    assert float(output["planar_reference_xy"][0]) < float(actual[0])
+    assert not policy.restart_required
 
 
 def test_invalid_velocity_cannot_publish_nonfinite_torques():
