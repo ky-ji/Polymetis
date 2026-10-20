@@ -18,7 +18,7 @@ class CartesianFixture(torch.nn.Module):
         return torch.zeros_like(q)
 
 
-def make_policy():
+def make_policy(**options):
     return PlanarImpedanceControl(
         torch.zeros(7), CartesianFixture(), torch.eye(3),
         [-0.1, -0.1], [0.1, 0.1],
@@ -28,6 +28,7 @@ def make_policy():
         velocity_time_constant=0.02, max_tracking_error=0.02,
         normal_travel=0.01, preload=1.0, preload_ramp_s=0.2,
         joint_damping=[0.1] * 7,
+        **options,
     )
 
 
@@ -115,3 +116,49 @@ def test_invalid_velocity_cannot_publish_nonfinite_torques():
     output = policy(state())
     assert bool(torch.isfinite(output["joint_torques"]).all())
     assert torch.allclose(output["planar_reference_xy"], torch.zeros(2))
+
+
+def test_free_translation_lifts_and_pause_discards_queued_height():
+    policy = torch.jit.script(make_policy(start_in_contact=False))
+    policy.update({"normal_velocity_desired": torch.tensor([0.05])})
+    for step in range(200):
+        command(policy, step + 1, velocity=(0, 0))
+        output = policy(state())
+    assert 0.004 < float(output["planar_reference_z"][0]) < 0.02
+    assert 0 < float(output["planar_normal_wrench"][0]) <= 8
+    command(policy, 201, paused=True)
+    output = policy(state())
+    assert float(output["planar_reference_z"][0]) == 0
+    assert float(output["planar_normal_wrench"][0]) == 0
+
+
+def test_contact_switch_anchors_here_and_ignores_vertical_input():
+    policy = torch.jit.script(make_policy(start_in_contact=False))
+    lifted = torch.tensor([0, 0, 0.08, 0, 0, 0, 0], dtype=torch.float32)
+    command(policy, 1, paused=True)
+    policy(state(lifted))
+    policy.update({"command_contact": torch.ones(1), "normal_velocity_desired": torch.tensor([0.05])})
+    command(policy, 2, paused=True)
+    output = policy(state(lifted))
+    assert float(output["planar_normal_wrench"][0]) == 0
+    for step in range(100):
+        command(policy, step + 3)
+        output = policy(state(lifted))
+    assert abs(float(output["planar_reference_z"][0]) - 0.08) < 1e-6
+    assert -1 <= float(output["planar_normal_wrench"][0]) < 0
+    policy.update({"command_contact": torch.zeros(1)})
+    command(policy, 104, paused=True)
+    output = policy(state(lifted))
+    assert float(output["planar_normal_wrench"][0]) == 0
+
+
+def test_stale_vertical_command_brakes_without_later_height_catchup():
+    policy = torch.jit.script(make_policy(start_in_contact=False))
+    policy.update({"normal_velocity_desired": torch.tensor([0.05])})
+    command(policy, 1, velocity=(0, 0))
+    for _ in range(200):
+        output = policy(state())
+    assert float(output["planar_reference_z"][0]) == 0
+    command(policy, 2, velocity=(0, 0))
+    output = policy(state())
+    assert float(output["planar_reference_z"][0]) == 0

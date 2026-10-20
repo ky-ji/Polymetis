@@ -1,8 +1,8 @@
 """Task-space planar impedance candidate; not selected by RobotInterface.
 
-Tangential velocity commands cannot alter the captured normal reference or
-orientation. Normal compliance and a bounded feedforward preload replace
-joint-position tracking in the contact direction. This is not measured force
+Translation mode accepts XYZ velocity while holding orientation. Contact mode
+accepts only tangential velocity and captures the current normal reference.
+Normal compliance and a bounded preload replace joint-position contact tracking. This is not measured force
 regulation: commanded normal wrench is not a measurement of contact force.
 """
 
@@ -37,6 +37,13 @@ class PlanarImpedanceControl(toco.PolicyModule):
         dt=0.001,
         timeout=0.15,
         ignore_gravity=True,
+        start_in_contact=True,
+        normal_bounds=None,
+        normal_speed=0.05,
+        normal_acceleration=0.3,
+        free_normal_stiffness=300.0,
+        free_normal_damping=15.0,
+        free_normal_force_up=8.0,
     ):
         super().__init__()
 
@@ -87,6 +94,17 @@ class PlanarImpedanceControl(toco.PolicyModule):
         self.invdyn = toco.modules.feedforward.InverseDynamics(robot_model, ignore_gravity=ignore_gravity)
         position, orientation = robot_model.forward_kinematics(q)
         initial_table = rotation.T @ position
+        normal_limits = vector(
+            normal_bounds if normal_bounds is not None else
+            [float(initial_table[2]) - normal_travel, float(initial_table[2]) + 0.2],
+            2, "normal_bounds",
+        )
+        if not float(normal_limits[0]) < float(initial_table[2]) < float(normal_limits[1]):
+            raise ValueError("initial TCP must be inside normal_bounds")
+        for value in (normal_speed, normal_acceleration, free_normal_stiffness,
+                      free_normal_damping, free_normal_force_up):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("free translation parameters must be finite and positive")
         if not bool(((low <= initial_table[:2]) & (initial_table[:2] <= high)).all()):
             raise ValueError("initial measured TCP is outside the tangential workspace")
         self.register_buffer("table_rotation", rotation.clone())
@@ -100,7 +118,11 @@ class PlanarImpedanceControl(toco.PolicyModule):
         self.register_buffer("orientation_reference", orientation.detach().clone())
         self.register_buffer("reference_xy", initial_table[:2].clone())
         self.register_buffer("velocity_xy", torch.zeros(2))
+        self.register_buffer("normal_bounds", normal_limits)
+        self.register_buffer("normal_velocity", torch.zeros(1))
         self.velocity_desired = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+        self.normal_velocity_desired = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+        self.command_contact = torch.nn.Parameter(torch.tensor([float(start_in_contact)]), requires_grad=False)
         self.command_sequence = torch.nn.Parameter(torch.zeros(1, dtype=torch.float64), requires_grad=False)
         self.command_paused = torch.nn.Parameter(torch.ones(1), requires_grad=False)
         self.max_speed = float(max_speed)
@@ -117,6 +139,12 @@ class PlanarImpedanceControl(toco.PolicyModule):
         self.active_time = 0.0
         self.was_active = False
         self.restart_required = False
+        self.contact = bool(start_in_contact)
+        self.normal_speed = float(normal_speed)
+        self.normal_acceleration = float(normal_acceleration)
+        self.free_normal_stiffness = float(free_normal_stiffness)
+        self.free_normal_damping = float(free_normal_damping)
+        self.free_normal_force_up = float(free_normal_force_up)
 
     def forward(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         q = state_dict["joint_positions"]
@@ -126,17 +154,26 @@ class PlanarImpedanceControl(toco.PolicyModule):
         twist = jacobian @ dq
         table_position = self.table_rotation.T @ position
         table_velocity = self.table_rotation.T @ twist[:3]
+        contact = float(self.command_contact[0]) == 1.0
+        mode_changed = contact != self.contact
+        if mode_changed:
+            # A mode switch starts here, never at a remembered surface or height.
+            self.normal_reference.copy_(table_position[2])
+            self.normal_velocity.zero_()
+            self.was_active = False
+            self.restart_required = False
+            self.contact = contact
         sequence = float(self.command_sequence[0])
         if math.isfinite(sequence) and sequence > self.last_sequence:
             self.last_sequence = sequence
             self.age = 0.0
         else:
             self.age += self.dt
-        valid = bool(torch.isfinite(self.velocity_desired).all())
-        near_plane = bool(torch.abs(table_position[2] - self.normal_reference) <= self.normal_travel)
+        valid = bool(torch.isfinite(self.velocity_desired).all() and torch.isfinite(self.normal_velocity_desired).all())
+        near_plane = not contact or bool(torch.abs(table_position[2] - self.normal_reference) <= self.normal_travel)
         inside_workspace = bool(
             ((self.xy_min <= table_position[:2]) & (table_position[:2] <= self.xy_max)).all()
-        )
+        ) and bool(self.normal_bounds[0] <= table_position[2] <= self.normal_bounds[1])
         paused = float(self.command_paused[0]) == 1.0
         if paused and near_plane and inside_workspace:
             self.restart_required = False
@@ -154,7 +191,10 @@ class PlanarImpedanceControl(toco.PolicyModule):
             # No queued displacement survives a pause, timeout, or re-engagement.
             self.reference_xy.copy_(table_position[:2])
             self.velocity_xy.zero_()
+            self.normal_velocity.zero_()
             self.active_time = 0.0
+            if not contact and (active or self.was_active):
+                self.normal_reference.copy_(table_position[2])
         if active:
             target_velocity = self.velocity_desired.clone()
             target_velocity *= min(1.0, self.max_speed / max(float(torch.norm(target_velocity)), 1e-8))
@@ -169,6 +209,16 @@ class PlanarImpedanceControl(toco.PolicyModule):
             error *= min(1.0, self.max_tracking_error / max(float(torch.norm(error)), 1e-8))
             self.reference_xy.copy_(table_position[:2] + error)
             self.active_time += self.dt
+            if not contact:
+                desired_normal = torch.clamp(self.normal_velocity_desired, -self.normal_speed, self.normal_speed)
+                change = torch.clamp(self.alpha * (desired_normal - self.normal_velocity),
+                                     -self.normal_acceleration * self.dt, self.normal_acceleration * self.dt)
+                self.normal_velocity.add_(change)
+                candidate_z = torch.clamp(self.normal_reference + self.dt * self.normal_velocity[0],
+                                          self.normal_bounds[0], self.normal_bounds[1])
+                self.normal_velocity.copy_(((candidate_z - self.normal_reference) / self.dt).reshape(1))
+                self.normal_reference.copy_(table_position[2] + torch.clamp(
+                    candidate_z - table_position[2], -self.max_tracking_error, self.max_tracking_error))
         self.was_active = active
 
         position_error = torch.cat([
@@ -177,12 +227,18 @@ class PlanarImpedanceControl(toco.PolicyModule):
         ])
         desired_velocity = torch.cat([self.velocity_xy, torch.zeros_like(table_position[2:3])])
         force_table = self.stiffness[:3] * position_error + self.damping[:3] * (desired_velocity - table_velocity)
-        if not near_plane:
+        if not contact:
+            force_table[2] = (self.free_normal_stiffness * position_error[2]
+                              + self.free_normal_damping * (self.normal_velocity[0] - table_velocity[2]))
+        elif not near_plane:
             # Do not seek the remembered surface after leaving its contact band.
             force_table[2] = -self.damping[2] * table_velocity[2]
-        if active:
+        if active and contact:
             force_table[2] -= self.preload * min(1.0, self.active_time / self.preload_ramp_s)
-        force_table = torch.maximum(-self.wrench_limits[:3], torch.minimum(self.wrench_limits[:3], force_table))
+        upper_force = self.wrench_limits[:3].clone()
+        if not contact:
+            upper_force[2] = self.free_normal_force_up
+        force_table = torch.maximum(-self.wrench_limits[:3], torch.minimum(upper_force, force_table))
 
         quaternion_error = R.functional.quaternion_multiply(
             R.functional.invert_quaternion(orientation), self.orientation_reference
@@ -200,4 +256,5 @@ class PlanarImpedanceControl(toco.PolicyModule):
             "joint_torques": torque,
             "planar_reference_xy": self.reference_xy.clone(),
             "planar_normal_wrench": force_table[2:3],
+            "planar_reference_z": self.normal_reference.reshape(1).clone(),
         }

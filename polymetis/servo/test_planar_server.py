@@ -63,12 +63,17 @@ def main():
         extent=torch.tensor(config['xy_half_extent'])
         fields=('stiffness','damping','wrench_limits','max_speed','max_acceleration','velocity_time_constant',
             'max_tracking_error','normal_travel','preload','preload_ramp_s','joint_damping','timeout')
-        policy=PlanarImpedanceControl(q,model,torch.eye(3),position[:2]-extent,position[:2]+extent,**{k:config[k] for k in fields})
+        optional=('start_in_contact','normal_bounds','normal_speed','normal_acceleration',
+            'free_normal_stiffness','free_normal_damping','free_normal_force_up')
+        policy=PlanarImpedanceControl(q,model,torch.eye(3),position[:2]-extent,position[:2]+extent,
+            **{k:config[k] for k in fields},**{k:config[k] for k in optional if k in config})
         stub.SetController(BaseRobotInterface._get_msg_generator(torch.jit.script(policy))(),timeout=5)
         phase[0]='paused';time.sleep(.2)
         for i in range(1,101):
             phase[0]='first_update' if i == 1 else 'repeated_updates'
             params=ParamDictContainer({'velocity_desired':torch.tensor([.02 if i%20<10 else -.02,0.]),
+                'normal_velocity_desired':torch.tensor([.02 if i<50 else 0.]),
+                'command_contact':torch.tensor([float(i>=50)]),
                 'command_sequence':torch.tensor([float(i)],dtype=torch.float64),'command_paused':torch.tensor([float(i%20==0)])})
             msg=BaseRobotInterface._get_msg_generator(torch.jit.script(params))
             start=time.perf_counter_ns()
