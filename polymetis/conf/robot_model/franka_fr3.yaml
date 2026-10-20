@@ -1,0 +1,12 @@
+# @package _group_
+# Verify these description limits against the robot system image before deployment.
+robot_description_path: "franka_fr3/fr3_arm.urdf"
+controlled_joints: [0, 1, 2, 3, 4, 5, 6]
+num_dofs: 7
+ee_link_idx: 7
+ee_link_name: "fr3_link8"
+rest_pose: [0, -0.4, 0, -2, 0, 2, 0.7]
+joint_limits_low: [-2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159]
+joint_limits_high: [2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159]
+joint_damping: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+torque_limits: [87, 87, 87, 87, 12, 12, 12]

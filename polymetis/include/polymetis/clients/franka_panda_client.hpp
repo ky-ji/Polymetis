@@ -12,6 +12,7 @@
 #include "yaml-cpp/yaml.h"
 
 #include "polymetis/utils.h"
+#include "polymetis/clients/flight_recorder.hpp"
 #include <grpcpp/grpcpp.h>
 
 #include <franka/exception.h>
@@ -25,6 +26,7 @@
 #define RECOVERY_MAX_TRIES 3
 
 class FrankaTorqueControlClient {
+  friend class FrankaRuntimeTest;
 private:
   void updateServerCommand(const franka::RobotState &libfranka_robot_state,
                            std::array<double, NUM_DOFS> &torque_out);
@@ -45,10 +47,15 @@ private:
 
   TorqueCommand torque_command_;
   RobotState robot_state_;
+  std::unique_ptr<polymetis_runtime::FlightRecorder> flight_recorder_;
+  double rpc_timeout_ms_ = 10.0;
+  double last_rpc_ms_ = 0.0;
+  polymetis_runtime::ServoReference servo_reference_;
 
   // libfranka
   bool mock_franka_;
   bool readonly_mode_;
+  bool automatic_recovery_;
 
   std::unique_ptr<franka::Robot> robot_ptr_;
   std::unique_ptr<franka::Model> model_ptr_;

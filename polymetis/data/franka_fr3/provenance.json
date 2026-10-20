@@ -1,0 +1,12 @@
+{
+  "source": "https://github.com/frankarobotics/franka_description",
+  "installed_package_version": "1.0.1",
+  "rendered_source_sha256": "0c5c82351ecd6746b573520d232b8f7f094b2f769d9391bafe4366354a86a69d",
+  "model_sha256": "da57faf285a750ce29ade4a5df8c42768a06422b117bf30c85fd3fb5a1b52c4f",
+  "changes": [
+    "Removed visual and collision meshes (control model only)",
+    "Removed identity fixed base joint",
+    "Removed trailing whitespace"
+  ],
+  "verification": "Robot system image, actual TCP and payload pending onsite verification; never use this file for collision checking."
+}

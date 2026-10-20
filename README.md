@@ -1,3 +1,17 @@
+# FR3 control runtime
+
+本仓库维护 Vela-Franka 使用的 FR3 控制运行时：原生硬件客户端、服务端、模型与
+连续关节参考轨迹。应用、GELLO 和采集界面位于
+[Vela-Franka](https://github.com/ky-ji/Vela-Franka)。
+
+- [隔离构建、模型核对与验收](polymetis/native/README.md)
+- [连续跟随与有界 lookahead](polymetis/servo/README.md)
+- [源码合并与部署版本关系](polymetis/native/collection-release.md)
+
+以下保留上游 Polymetis 说明。实验与历史目录不作为当前 FR3 的构建或启动入口。
+
+---
+
 ![Polymetis: a real-time PyTorch controller manager](./docs/source/img/polymetis-logo.svg)
 
 ## A real-time PyTorch controller manager

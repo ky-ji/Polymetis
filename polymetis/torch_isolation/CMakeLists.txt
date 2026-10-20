@@ -7,14 +7,15 @@ project(torch_isolation)
 
 add_subdirectory("pinocchio_isolation/")
 
-add_definitions(-D_GLIBCXX_USE_CXX11_ABI=0)
 
-# Find Torch
-execute_process (
-    COMMAND bash -c "python -c 'from distutils.sysconfig import get_python_lib; print(get_python_lib())' | tr -d '\n'"
-    OUTPUT_VARIABLE site_packages_path
-)
-set(Torch_DIR "${site_packages_path}/torch/share/cmake/Torch/")
+
+# Respect an explicit Torch_DIR and interpreter in isolated builds.
+if(NOT Torch_DIR)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    execute_process(COMMAND "${Python3_EXECUTABLE}" -c
+        "import torch; print(torch.utils.cmake_prefix_path + '/Torch')"
+        OUTPUT_VARIABLE Torch_DIR OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+endif()
 find_package(Torch REQUIRED)
 
 # Find Eigen
@@ -46,3 +47,8 @@ target_link_libraries(torchscript_pinocchio PRIVATE
     "${TORCH_LIBRARIES}"
     torchrot
 )
+
+foreach(target torch_server_ops torchrot torchscript_pinocchio)
+    target_compile_definitions(${target} PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+    install(TARGETS ${target} LIBRARY DESTINATION lib)
+endforeach()

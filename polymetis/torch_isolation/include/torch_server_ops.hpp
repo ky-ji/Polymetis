@@ -5,6 +5,9 @@
 #ifndef TORCH_SERVER_OPS_H
 #define TORCH_SERVER_OPS_H
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <vector>
 
@@ -46,6 +49,8 @@ public:
 class C_TORCH_EXPORT TorchScriptedController {
 private:
   struct TorchScriptModule *module_ = nullptr;
+  std::array<float, 22> servo_reference_{};
+  bool has_servo_reference_ = false;
   TorchRobotState robot_state_ = TorchRobotState(1);
 
   // Inputs
@@ -61,8 +66,11 @@ public:
 
   std::vector<float> forward(TorchRobotState &input);
 
+  const std::array<float, 22>& servo_reference() const { return servo_reference_; }
+  bool has_servo_reference() const { return has_servo_reference_; }
   bool param_dict_load(char *data, size_t size);
   void param_dict_update_module();
+  void update_joint_target(const std::array<float, 7>& target, int64_t sequence, bool paused);
 
   bool is_terminated();
   void reset();

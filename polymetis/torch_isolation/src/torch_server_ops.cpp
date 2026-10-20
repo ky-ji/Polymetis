@@ -8,6 +8,7 @@
 #include <torch/jit.h>
 #include <torch/script.h>
 #include <torch/torch.h>
+#include <torch/csrc/jit/runtime/graph_executor.h>
 #include <vector>
 
 extern "C" {
@@ -134,12 +135,26 @@ TorchScriptedController::~TorchScriptedController() {
 
 std::vector<float> TorchScriptedController::forward(TorchRobotState &input) {
   torch::NoGradGuard no_grad;
+  // An unseen safety branch must not trigger JIT profiling or specialization
+  // inside a realtime callback. Warmup cannot exercise every runtime branch.
+  torch::jit::GraphOptimizerEnabledGuard no_optimization(false);
   // Step controller & generate torque command response
   c10::Dict<torch::jit::IValue, torch::jit::IValue> controller_state_dict =
       module_->data.forward(input.input_->data).toGenericDict();
 
   torch::jit::IValue key = torch::jit::IValue("joint_torques");
   torch::Tensor desired_torque = controller_state_dict.at(key).toTensor();
+
+  has_servo_reference_ = controller_state_dict.contains("joint_reference");
+  if (has_servo_reference_) {
+    const char* keys[] = {"joint_reference", "joint_velocity_reference", "joint_acceleration_reference"};
+    for (int part = 0; part < 3; ++part) {
+      auto values = controller_state_dict.at(keys[part]).toTensor();
+      TORCH_CHECK(values.numel() == 7, "servo reference must have seven entries");
+      for (int i = 0; i < 7; ++i) servo_reference_[part * 7 + i] = values[i].item<float>();
+    }
+    servo_reference_[21] = controller_state_dict.at("servo_status").toTensor()[0].item<float>();
+  }
 
   std::vector<float> result;
   for (int i = 0; i < input.num_dofs_; i++) {
@@ -163,10 +178,12 @@ void TorchScriptedController::warmup_controller(
 }
 
 bool TorchScriptedController::is_terminated() {
+  torch::jit::GraphOptimizerEnabledGuard no_optimization(false);
   return module_->data.get_method("is_terminated")(empty_input_->data).toBool();
 }
 
 void TorchScriptedController::reset() {
+  torch::jit::GraphOptimizerEnabledGuard no_optimization(false);
   module_->data.get_method("reset")(empty_input_->data);
 }
 
@@ -192,6 +209,17 @@ bool TorchScriptedController::param_dict_load(char *data, size_t size) {
 
 void TorchScriptedController::param_dict_update_module() {
   module_->data.get_method("update")(param_dict_input_->data);
+}
+
+void TorchScriptedController::update_joint_target(const std::array<float, 7>& target,
+                                                  int64_t sequence, bool paused) {
+  torch::NoGradGuard no_grad;
+  auto position = module_->data.attr("joint_pos_desired").toTensor();
+  TORCH_CHECK(position.numel() == 7 && position.scalar_type() == torch::kFloat32 && position.is_contiguous(),
+              "joint servo requires seven contiguous float32 targets");
+  std::copy(target.begin(), target.end(), position.data_ptr<float>());
+  module_->data.attr("command_sequence").toTensor().fill_(sequence);
+  module_->data.attr("command_paused").toTensor().fill_(paused ? 1.0 : 0.0);
 }
 
 } /* extern "C" */

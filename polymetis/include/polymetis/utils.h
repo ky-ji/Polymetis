@@ -9,6 +9,9 @@
 #include <istream>
 #include <streambuf>
 #include <vector>
+#include <mutex>
+#include <optional>
+#include "polymetis/priority_mutex.hpp"
 
 #include "polymetis.grpc.pb.h"
 
@@ -21,30 +24,35 @@ template <typename T> class CircularBuffer {
 private:
   std::vector<T> elems;
   ulong index = 0;
+  mutable PriorityMutex mutex_;
 
 public:
-  CircularBuffer<T>(int capacity) { elems.reserve(capacity); }
+  CircularBuffer<T>(int capacity) : elems(capacity) {
+    if (capacity <= 0) throw std::invalid_argument("buffer capacity must be positive");
+  }
 
-  std::size_t capacity() { return elems.capacity(); }
+  std::size_t capacity() { return elems.size(); }
 
   void clear() {
+    std::lock_guard<PriorityMutex> lock(mutex_);
     index = 0;
-    elems.clear();
   }
 
   void append(T elem) {
+    std::lock_guard<PriorityMutex> lock(mutex_);
     elems[index % capacity()] = elem;
     index++;
   }
 
-  T *get(int i) {
-    if (i >= index || index - i > capacity()) {
-      return NULL;
+  std::optional<T> get(long i) {
+    std::lock_guard<PriorityMutex> lock(mutex_);
+    if (i < 0 || static_cast<ulong>(i) >= index || index - i > capacity()) {
+      return std::nullopt;
     }
-    return &elems[i % capacity()];
+    return elems[i % capacity()];
   }
 
-  ulong size() { return index; }
+  ulong size() { std::lock_guard<PriorityMutex> lock(mutex_); return index; }
 };
 
 /*

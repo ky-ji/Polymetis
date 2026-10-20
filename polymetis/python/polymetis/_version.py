@@ -1,41 +1,27 @@
-import os
+"""Resolve package provenance without shell commands or process-wide chdir."""
 import json
+import os
+from pathlib import Path
+import subprocess
 
-import polymetis
 
-__version__ = ""
+def _version():
+    explicit = os.environ.get("POLYMETIS_BUILD_VERSION")
+    if explicit:
+        return explicit
+    package = Path(__file__).resolve().parent
+    prefix = os.environ.get("CONDA_PREFIX")
+    if prefix and Path(prefix).resolve() in package.parents:
+        for record in sorted((Path(prefix) / "conda-meta").glob("polymetis-*.json")):
+            info = json.loads(record.read_text())
+            if info.get("name") == "polymetis":
+                return info["version"]
+    try:
+        result = subprocess.run(["git", "rev-parse", "--short=12", "HEAD"], cwd=str(package),
+                                check=True, capture_output=True, text=True, timeout=2)
+        return "0.2+" + result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "0.2_local"
 
-# Conda installed: Get version of conda pkg (assigned $GIT_DESCRIBE_NUMBER during build)
-if "CONDA_PREFIX" in os.environ and os.environ["CONDA_PREFIX"] in polymetis.__file__:
-    # Search conda pkgs for polymetis & extract version number
-    stream = os.popen("conda list | grep polymetis")
-    for line in stream:
-        info_fields = [s for s in line.strip("\n").split(" ") if len(s) > 0]
-        if info_fields[0] == "polymetis":  # pkg name == polymetis
-            __version__ = info_fields[1]
-            break
 
-# Built locally: Retrive git tag description of Polymetis source code
-else:
-    # Navigate to polymetis pkg dir, which should be within the git repo
-    original_cwd = os.getcwd()
-    os.chdir(os.path.dirname(polymetis.__file__))
-
-    # Git describe output
-    stream = os.popen("git describe --tags")
-    version_lines = [line for line in stream]
-    
-    if version_lines:
-        version_string = version_lines[0]
-        # Modify to same format as conda env variable GIT_DESCRIBE_NUMBER
-        version_items = version_string.strip("\n").split("-")
-        __version__ = f"{version_items[-2]}_{version_items[-1]}"
-    else:
-        # Fallback version if git is not available
-        __version__ = "0.2_local"
-
-    # Reset cwd
-    os.chdir(original_cwd)
-
-if not __version__:
-    raise Exception("Cannot locate Polymetis version!")
+__version__ = _version()

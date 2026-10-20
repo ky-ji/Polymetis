@@ -8,21 +8,26 @@ from typing import Tuple, Optional
 import torch
 from polymetis.utils.data_dir import PKG_ROOT_DIR
 
-try:
-    torch.classes.load_library(
-        f"{os.environ['CONDA_PREFIX']}/lib/libtorchscript_pinocchio.so"
-    )
-except OSError:
-    lib_path = os.path.abspath(
-        os.path.join(
-            PKG_ROOT_DIR,
-            "../../build/torch_isolation/libtorchscript_pinocchio.so",
+if os.environ.get("POLYMETIS_TORCH_LIB_DIR"):
+    # Explicit isolated runtimes must never fall back to another installation.
+    torch.classes.load_library(os.path.join(os.environ["POLYMETIS_TORCH_LIB_DIR"], "libtorchscript_pinocchio.so"))
+else:
+    try:
+        torch.classes.load_library(
+            f"{os.environ['CONDA_PREFIX']}/lib/libtorchscript_pinocchio.so"
         )
-    )
-    print(
-        f"Warning: Failed to load 'libtorchscript_pinocchio.so' from CONDA_PREFIX, loading from default build directory instead: '{lib_path}'"
-    )
-    torch.classes.load_library(lib_path)
+    except OSError:
+        lib_path = os.path.abspath(
+            os.path.join(
+                PKG_ROOT_DIR,
+                "../../build/torch_isolation/libtorchscript_pinocchio.so",
+            )
+        )
+        print(
+            f"Warning: Failed to load 'libtorchscript_pinocchio.so' from CONDA_PREFIX, loading from default build directory instead: '{lib_path}'"
+        )
+        torch.classes.load_library(lib_path)
+
 
 
 class RobotModelPinocchio(torch.nn.Module):

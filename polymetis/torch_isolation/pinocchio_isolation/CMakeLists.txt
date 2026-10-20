@@ -17,7 +17,9 @@ endif()
 find_package(Eigen3 REQUIRED)
 
 # Find Pinocchio
-set(pinocchio_DIR $ENV{CONDA_PREFIX}/lib/cmake/pinocchio)
+if(NOT pinocchio_DIR)
+    set(pinocchio_DIR "$ENV{CONDA_PREFIX}/lib/cmake/pinocchio")
+endif()
 find_package(pinocchio REQUIRED)
 
 include_directories(
@@ -32,3 +34,5 @@ target_link_libraries(pinocchio_wrapper
     ${pinocchio_LIBRARIES}
     spdlog::spdlog
 )
+
+install(TARGETS pinocchio_wrapper LIBRARY DESTINATION lib)
